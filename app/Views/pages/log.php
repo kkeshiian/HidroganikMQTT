@@ -129,6 +129,9 @@ const firebaseConfigLog = {
 };
 try { if (!firebase.apps.length) { firebase.initializeApp(firebaseConfigLog); } } catch(e) { console.warn('Firebase init log page:', e); }
 const dbLog = firebase.database();
+// Log source mode: 'history' (default) or 'realtime' (ephemeral previews from kebun-*/realtime)
+// Keep 'history' so the page catches up even if tab sempat tertutup.
+const LOG_SOURCE = 'history';
 
 let logDataCache = [];
 let currentPage = 1;
@@ -141,6 +144,71 @@ const CHUNK_SIZE = 100; // rows per lazy render chunk
 let isRenderingChunk = false;
 // Live listeners registry
 let liveListenerHandles = [];
+// De-duplication registry for rendered/known rows (device:key). We now only de-dup by unique child key
+// so every record pushed by ESP8266 shows up; no per-second collapsing.
+const logSeenIds = new Set();
+
+// Visual de-dup: keep only one row per device per second to avoid duplicates
+// coming from the same device in the same second.
+const rowSecondMap = new Map(); // key: DEVICE|tsSec -> row
+
+function addRowWithSecondDedup(row){
+    const key = `${row.device}|${Math.floor(row.timestamp/1000)}`;
+    rowSecondMap.set(key, row); // latest wins
+    // rebuild cache from map values
+    logDataCache = Array.from(rowSecondMap.values());
+}
+
+// Robust timestamp parser for various device payload shapes
+function computeTimestampFromData(data){
+    if (!data || typeof data !== 'object') return null;
+    // 1) Direct numeric candidates (ms or sec)
+    const num = (v)=> (typeof v === 'number' ? v : (typeof v === 'string' && v.trim()!=='' && !isNaN(+v) ? +v : null));
+    const msRange = (v)=> v && v>946684800000 && v<4102444800000; // roughly 2000-01-01 .. 2100-01-01
+    const secRange = (v)=> v && v>946684800 && v<4102444800;
+    const candidates = [data.timestamp, data.createdAt, data._ts, data.ts, data.time];
+    for (const c of candidates){
+        const n = num(c);
+        if (n!==null){
+            if (msRange(n)) return n;
+            if (secRange(n)) return n*1000;
+        }
+    }
+    // 2) date + time strings, e.g. '14/10/2025' + '17.58.57' or '17:58:57'
+    const dateStr = (typeof data.date === 'string') ? data.date.trim() : '';
+    const timeStr = (typeof data.time === 'string') ? data.time.trim() : '';
+    if (dateStr){
+        // Try DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+        let y,m,d;
+        let mDate;
+        let m1 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+        if (m1){
+            d = parseInt(m1[1],10); m = parseInt(m1[2],10); y = parseInt(m1[3],10); if (y<100) y += 2000;
+        } else {
+            let m2 = dateStr.match(/^(\d{4})[\-](\d{1,2})[\-](\d{1,2})$/);
+            if (m2){ y=parseInt(m2[1],10); m=parseInt(m2[2],10); d=parseInt(m2[3],10); }
+        }
+        if (y && m && d){
+            let hh=0, mm=0, ss=0;
+            if (timeStr){
+                // Accept HH:MM[:SS] or HH.MM[.SS]
+                const t = timeStr.match(/^(\d{1,2})[:\.](\d{1,2})(?:[:\.]?(\d{1,2}))?$/);
+                if (t){ hh = parseInt(t[1],10)||0; mm = parseInt(t[2],10)||0; ss = parseInt(t[3]||'0',10)||0; }
+            }
+            const dt = new Date(y, (m-1), d, hh, mm, ss);
+            const ts = dt.getTime();
+            if (!isNaN(ts)) return ts;
+        }
+    }
+    // 3) Fallback: try ISO-like strings if present in some other field
+    for (const [k,v] of Object.entries(data)){
+        if (typeof v === 'string' && v.length>=10){
+            const t = Date.parse(v);
+            if (!isNaN(t)) return t;
+        }
+    }
+    return null;
+}
 
 // Debounce utility
 function debounce(fn, delay=500){ let t; return function(...a){ clearTimeout(t); t=setTimeout(()=>fn.apply(this,a),delay); }; }
@@ -156,6 +224,9 @@ function loadLogData() {
     tableBody.innerHTML = '';
     // Detach any existing live listeners when reloading with new filters
     detachLiveListeners();
+    // Reset de-dup registry and cache on fresh load
+    logSeenIds.clear();
+    rowSecondMap.clear();
     const startDateInput = document.getElementById('start-date');
     const endDateInput = document.getElementById('end-date');
     const deviceFilter = document.getElementById('device-filter').value;
@@ -175,26 +246,55 @@ function loadFromRealtimeData(startDate, endDate, deviceFilter) {
     const devices = deviceFilter === 'all' ? ['a','b'] : [deviceFilter.toLowerCase()];
     const startMs = startDate.getTime();
     const endMs = endDate.getTime();
-    let allData = []; let loadedDevices = 0;
+    // If using realtime mode, skip history query and attach realtime listeners immediately
+    if (LOG_SOURCE === 'realtime') {
+        // Clear any previous cache (already cleared in loadLogData)
+        // Attach realtime listeners and finish loading UI
+        attachRealtimeListeners(devices, startMs, endMs);
+        document.getElementById('loading-indicator').classList.add('hidden');
+        document.getElementById('pagination').classList.remove('hidden');
+        updatePagination();
+        return;
+    }
+    let loadedDevices = 0;
     devices.forEach(device => {
-        let queryRef = dbLog.ref(`kebun-${device}/history`).orderByChild('timestamp').startAt(startMs).endAt(endMs);
-        queryRef.once('value').then(snapshot => {
-            if (!snapshot.exists()) {
-                return dbLog.ref(`kebun-${device}/history`).once('value').then(fullSnap => {
-                    if (fullSnap.exists()) { fullSnap.forEach(ch => processChild(device,ch)); }
-                });
-            } else { snapshot.forEach(ch => processChild(device,ch)); }
-        }).catch(err => { console.error('Query error', device, err); }).finally(()=>{ loadedDevices++; if (loadedDevices===devices.length) finalize(); });
+        console.log(`🔍 Loading history (full scan) for kebun-${device} then filtering by ${startMs}..${endMs}`);
+        const ref = dbLog.ref(`kebun-${device}/history`);
+        ref.once('value')
+            .then(snapshot => {
+                if (!snapshot.exists()) {
+                    console.log(`❌ No history data at all for kebun-${device}`);
+                    return;
+                }
+                snapshot.forEach(ch => processChild(device, ch));
+            })
+            .catch(err => { console.error('Query error', device, err); })
+            .finally(() => { loadedDevices++; if (loadedDevices === devices.length) finalize(); });
     });
     function processChild(device, child) {
         const data = child.val();
-        let ts = null;
-        if (typeof data.timestamp === 'number') ts = data.timestamp;
-        else if (typeof data.timestamp === 'string' && !isNaN(+data.timestamp)) ts = +data.timestamp;
-        else if (typeof data.createdAt === 'number') ts = data.createdAt;
-        else if (data.date && data.time) { const dt = new Date(`${data.date} ${data.time}`); if (!isNaN(dt.getTime())) ts = dt.getTime(); }
-        if (ts === null) return; if (ts < startMs || ts > endMs) return;
-        allData.push({
+        console.log(`🔍 Processing record for ${device}:`, child.key, data);
+        console.log(`📋 Available fields:`, Object.keys(data));
+        // De-dup guard: avoid adding the same child twice
+        const rowId = `${device}:${child.key}`;
+        if (logSeenIds.has(rowId)) {
+            console.log(`↩️  Skip duplicate initial row ${rowId}`);
+            return;
+        }
+        
+        let ts = computeTimestampFromData(data);
+        
+    console.log(`⏰ Computed timestamp: ${ts} (${ts ? new Date(ts).toISOString() : 'null'})`);
+        if (ts === null) {
+            console.warn(`⚠️ No valid timestamp found for record ${child.key}. Available fields:`, Object.keys(data));
+            return;
+        }
+        if (ts < startMs || ts > endMs) {
+            console.log(`🚫 Record ${child.key} outside date range (${new Date(ts).toISOString()})`);
+            return;
+        }
+        console.log(`✅ Adding record ${child.key} to results`);
+        const record = {
             id: child.key,
             timestamp: ts,
             device: device.toUpperCase(),
@@ -204,17 +304,32 @@ function loadFromRealtimeData(startDate, endDate, deviceFilter) {
             cal_ph_asam: parseFloat(data.cal_ph_asam) || 0,
             cal_ph_netral: parseFloat(data.cal_ph_netral) || 0,
             cal_tds_k: parseFloat(data.cal_tds_k) || 0
-        });
+        };
+        console.log(`📋 Created record:`, record);
+        // Add with per-second visual dedup
+        addRowWithSecondDedup(record);
+        // Optional cap to avoid memory bloat
+        const MAX_ROWS = 5000;
+        if (logDataCache.length > MAX_ROWS) {
+            logDataCache = logDataCache.slice(logDataCache.length - MAX_ROWS);
+        }
+    logSeenIds.add(rowId);
     }
     function finalize() {
-        logDataCache = allData;
+    console.log(`🏁 Finalized with ${logDataCache.length} records`);
         sortCache();
         displayLogData(logDataCache); updateStatistics(logDataCache);
         document.getElementById('loading-indicator').classList.add('hidden');
-        if (!logDataCache.length) document.getElementById('no-data-message').classList.remove('hidden');
-        else { document.getElementById('pagination').classList.remove('hidden'); updatePagination(); }
-        // Attach live listeners for new incoming history entries within the current range
-        attachLiveListeners(devices, startMs, endMs);
+        if (!logDataCache.length) {
+            console.log(`📭 No data to display, showing no-data message`);
+            document.getElementById('no-data-message').classList.remove('hidden');
+        } else { 
+            console.log(`📋 Displaying ${logDataCache.length} records`);
+            document.getElementById('pagination').classList.remove('hidden'); 
+            updatePagination(); 
+        }
+        // Attach live listeners for new incoming entries
+        if (LOG_SOURCE === 'history') attachLiveListeners(devices, startMs, endMs);
     }
 }
 
@@ -305,17 +420,20 @@ function attachLiveListeners(devices, startMs, endMs){
     }
     devices.forEach(dev=>{
         const baseStart = Math.max(startMs, (latestByDevice[dev]||startMs)) + 1;
-        const ref = dbLog.ref(`kebun-${dev}/history`).orderByChild('timestamp').startAt(baseStart);
+        // Listen to all child_added and filter by computed timestamp so we don't miss records lacking 'timestamp'
+        const ref = dbLog.ref(`kebun-${dev}/history`);
         const handler = (snap)=>{
             const data = snap.val(); if(!data) return;
+            const dedupId = `${dev}:${snap.key}`;
+            if (logSeenIds.has(dedupId)) {
+                // Already rendered from initial load or earlier live event
+                return;
+            }
             // Compute timestamp robustly
-            let ts = null;
-            if (typeof data.timestamp === 'number') ts = data.timestamp;
-            else if (typeof data.timestamp === 'string' && !isNaN(+data.timestamp)) ts = +data.timestamp;
-            else if (typeof data.createdAt === 'number') ts = data.createdAt;
-            else if (data.date && data.time) { const dt = new Date(`${data.date} ${data.time}`); if (!isNaN(dt.getTime())) ts = dt.getTime(); }
+            let ts = computeTimestampFromData(data);
             if (ts === null) return;
             if (ts < startMs || ts > endMs) return; // outside current filter range
+            if (ts <= baseStart) return; // ignore already covered earlier entries
             const row = {
                 id: snap.key,
                 timestamp: ts,
@@ -327,13 +445,54 @@ function attachLiveListeners(devices, startMs, endMs){
                 cal_ph_netral: parseFloat(data.cal_ph_netral) || 0,
                 cal_tds_k: parseFloat(data.cal_tds_k) || 0
             };
-            logDataCache.push(row);
+            // Add with per-second visual dedup
+            addRowWithSecondDedup(row);
+            const MAX_ROWS = 5000;
+            if (logDataCache.length > MAX_ROWS) {
+                logDataCache = logDataCache.slice(logDataCache.length - MAX_ROWS);
+            }
+            logSeenIds.add(dedupId);
             sortCache();
             updateStatistics(logDataCache);
             displayLogData(logDataCache);
             updatePagination();
         };
         ref.on('child_added', handler);
+        liveListenerHandles.push({ref, handler});
+    });
+}
+
+// Realtime listeners: observe kebun-*/realtime and emit ephemeral rows with current timestamp
+function attachRealtimeListeners(devices, startMs, endMs){
+    devices.forEach(dev=>{
+        const ref = dbLog.ref(`kebun-${dev}/realtime`);
+        const handler = (snap)=>{
+            const data = snap.val(); if(!data) return;
+            const ts = Date.now();
+            if (ts < startMs || ts > endMs) return; // respect current filter range
+            const row = {
+                id: `rt-${dev}-${ts}`,
+                timestamp: ts,
+                device: dev.toUpperCase(),
+                ph: parseFloat(data.ph) || 0,
+                tds: parseInt(data.tds) || 0,
+                temperature: parseFloat(data.suhu ?? data.temperature) || 0,
+                cal_ph_asam: parseFloat(data.cal_ph_asam) || 0,
+                cal_ph_netral: parseFloat(data.cal_ph_netral) || 0,
+                cal_tds_k: parseFloat(data.cal_tds_k) || 0
+            };
+            // Add with per-second visual dedup (latest in the same second wins)
+            addRowWithSecondDedup(row);
+            const MAX_ROWS = 5000;
+            if (logDataCache.length > MAX_ROWS) {
+                logDataCache = logDataCache.slice(logDataCache.length - MAX_ROWS);
+            }
+            sortCache();
+            updateStatistics(logDataCache);
+            displayLogData(logDataCache);
+            updatePagination();
+        };
+        ref.on('value', handler);
         liveListenerHandles.push({ref, handler});
     });
 }

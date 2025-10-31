@@ -264,7 +264,7 @@
                     </div>
 
                     <!-- Live Sensor Data -->
-                    <div class="grid grid-cols-3 gap-4 mb-6">
+                    <div class="grid grid-cols-4 gap-4 mb-6">
                         <div
                             class="bg-gradient-to-br from-green-50 to-green-100 rounded-xl p-4 text-center border border-green-200"
                         >
@@ -309,6 +309,22 @@
                             <p
                                 id="a-suhu"
                                 class="text-xl font-bold text-blue-700 metric-value"
+                            >
+                                --
+                            </p>
+                        </div>
+                        <div
+                            class="bg-gradient-to-br from-violet-50 to-violet-100 rounded-xl p-4 text-center border border-violet-200"
+                        >
+                            <div
+                                class="w-8 h-8 bg-violet-500 rounded-full mx-auto mb-2 flex items-center justify-center"
+                            >
+                                <span class="text-white text-sm">🔬</span>
+                            </div>
+                            <p class="text-xs text-violet-600 font-medium mb-1">TDS Mentah</p>
+                            <p
+                                id="a-tds-raw"
+                                class="text-xl font-bold text-violet-700 metric-value"
                             >
                                 --
                             </p>
@@ -428,7 +444,7 @@
                     </div>
 
                     <!-- Live Sensor Data -->
-                    <div class="grid grid-cols-3 gap-4 mb-6">
+                    <div class="grid grid-cols-4 gap-4 mb-6">
                         <div
                             class="bg-gradient-to-br from-green-50 to-green-100 rounded-xl p-4 text-center border border-green-200"
                         >
@@ -473,6 +489,22 @@
                             <p
                                 id="b-suhu"
                                 class="text-xl font-bold text-blue-700 metric-value"
+                            >
+                                --
+                            </p>
+                        </div>
+                        <div
+                            class="bg-gradient-to-br from-violet-50 to-violet-100 rounded-xl p-4 text-center border border-violet-200"
+                        >
+                            <div
+                                class="w-8 h-8 bg-violet-500 rounded-full mx-auto mb-2 flex items-center justify-center"
+                            >
+                                <span class="text-white text-sm">🔬</span>
+                            </div>
+                            <p class="text-xs text-violet-600 font-medium mb-1">TDS Mentah</p>
+                            <p
+                                id="b-tds-raw"
+                                class="text-xl font-bold text-violet-700 metric-value"
                             >
                                 --
                             </p>
@@ -628,33 +660,130 @@
             firebase.initializeApp(firebaseConfig);
             const db = firebase.database();
 
+            // Data source selection: 'mqtt' | 'firebase' | 'both'
+            const DATA_SOURCE = 'firebase';
+
             // MQTT setup (same broker as dashboard)
-            const MQTT_WS_URL = "wss://broker.hivemq.com:8884/mqtt";
+            const MQTT_WS_URL = "wss://broker.emqx.io:8084/mqtt";
             const MQTT_OPTIONS = {
                 clean: true,
                 connectTimeout: 4000,
+                reconnectPeriod: 5000,
+                keepalive: 60,
+                protocolVersion: 4,
                 clientId: `web-kalibrasi-${Math.random().toString(16).slice(2)}`,
             };
             let mqttClient = null;
+            let mqttConnected = false;
 
             function initMqttCal(){
-                if (!window.mqtt){ console.warn("MQTT library not found on calibration page"); return; }
+                const currentTime = new Date().toLocaleTimeString("id-ID");
+                
+                if (!window.mqtt){ 
+                    console.warn(`[${currentTime}] ❌ MQTT library not found on calibration page`);
+                    log("⚠️ MQTT library not loaded. Commands will use Firebase only.");
+                    showToast("MQTT not available. Using Firebase fallback.", "warning", 3000);
+                    return; 
+                }
+                
+                console.log(`[${currentTime}] 🔌 Initializing MQTT for calibration page...`);
+                log("🔌 Connecting to MQTT broker...");
+                
                 try {
                     mqttClient = mqtt.connect(MQTT_WS_URL, MQTT_OPTIONS);
+                    
                     mqttClient.on('connect', ()=>{
-                        console.log(`🔌 MQTT connected (kalibrasi) to ${MQTT_WS_URL}`);
+                        const t = new Date().toLocaleTimeString("id-ID");
+                        mqttConnected = true;
+                        console.log(`[${t}] ✅ MQTT connected (kalibrasi) to ${MQTT_WS_URL}`);
+                        log(`✅ MQTT connected to ${MQTT_WS_URL}`);
+                        showToast("MQTT connected! Ready to send calibration commands.", "success", 3000);
+                        
+                        // Subscribe to telemetry topics so UI updates even if Firebase mirror delay exists
+                        try { 
+                            mqttClient.subscribe(['hidroganik/kebun-a/telemetry','hidroganik/kebun-b/telemetry'], (err) => {
+                                if (err) {
+                                    console.error(`[${t}] ❌ MQTT subscribe error:`, err);
+                                } else {
+                                    console.log(`[${t}] ✅ Subscribed to telemetry topics`);
+                                    log("✅ Subscribed to sensor data topics");
+                                }
+                            });
+                        }
+                        catch(e){ console.warn('MQTT subscribe failed (kalibrasi):', e); }
                     });
-                    mqttClient.on('error', (e)=> console.warn('MQTT error (kalibrasi):', e?.message||e));
-                    mqttClient.on('reconnect', ()=> console.log('MQTT reconnecting (kalibrasi)...'));
-                } catch(e){ console.warn('MQTT init failed (kalibrasi):', e); }
+                    
+                    mqttClient.on('error', (e)=> {
+                        const t = new Date().toLocaleTimeString("id-ID");
+                        mqttConnected = false;
+                        console.error(`[${t}] ❌ MQTT error (kalibrasi):`, e?.message||e);
+                        log(`❌ MQTT error: ${e?.message || 'Connection failed'}`);
+                        showToast("MQTT connection error. Using Firebase fallback.", "error", 4000);
+                    });
+                    
+                    mqttClient.on('reconnect', ()=> {
+                        const t = new Date().toLocaleTimeString("id-ID");
+                        console.log(`[${t}] 🔄 MQTT reconnecting (kalibrasi)...`);
+                        log("🔄 MQTT reconnecting...");
+                    });
+                    
+                    mqttClient.on('disconnect', ()=> {
+                        const t = new Date().toLocaleTimeString("id-ID");
+                        mqttConnected = false;
+                        console.log(`[${t}] 🔌 MQTT disconnected (kalibrasi)`);
+                        log("🔌 MQTT disconnected");
+                    });
+                    
+                    mqttClient.on('close', ()=> {
+                        const t = new Date().toLocaleTimeString("id-ID");
+                        mqttConnected = false;
+                        console.log(`[${t}] 🔒 MQTT connection closed (kalibrasi)`);
+                    });
+                    
+                    mqttClient.on('message', (topic, payloadBuf)=>{
+                        const t = String(topic||'');
+                        let unit = null;
+                        if (t.includes('kebun-a')) unit = 'A';
+                        else if (t.includes('kebun-b')) unit = 'B';
+                        if (!unit) return;
+                        try {
+                            const msg = JSON.parse(payloadBuf.toString('utf8')) || {};
+                            setText(`${unit.toLowerCase()}-ph`, msg.ph, 2);
+                            setText(`${unit.toLowerCase()}-tds`, msg.tds, 0);
+                            setText(`${unit.toLowerCase()}-tds-raw`, getRawTds(msg), 0);
+                            setText(`${unit.toLowerCase()}-suhu`, getWaterTemp(msg), 1);
+                            setText(`${unit.toLowerCase()}-cal-asam`, msg.cal_ph_asam, 4);
+                            setText(`${unit.toLowerCase()}-cal-netral`, msg.cal_ph_netral, 4);
+                            setText(`${unit.toLowerCase()}-cal-tds-k`, msg.cal_tds_k, 4);
+                        } catch(e){ /* ignore parse errors */ }
+                    });
+                } catch(e){ 
+                    console.warn(`[${currentTime}] ❌ MQTT init failed (kalibrasi):`, e);
+                    log(`❌ MQTT initialization failed: ${e.message}`);
+                    showToast("MQTT initialization failed. Using Firebase only.", "error", 4000);
+                }
             }
             function mqttPublishCalibration(unit, payload){
-                if (!mqttClient || !mqttClient.connected) return false;
+                if (!mqttClient) {
+                    console.warn(`[Kalibrasi] MQTT client not initialized`);
+                    return false;
+                }
+                
+                if (!mqttClient.connected) {
+                    console.warn(`[Kalibrasi] MQTT client not connected`);
+                    return false;
+                }
+                
                 const topic = unit === 'A' ? 'hidroganik/kebun-a/cmd' : 'hidroganik/kebun-b/cmd';
                 try {
-                    mqttClient.publish(topic, JSON.stringify(payload));
+                    const message = JSON.stringify(payload);
+                    mqttClient.publish(topic, message);
+                    console.log(`[Kalibrasi] 📤 MQTT published to ${topic}:`, payload);
                     return true;
-                } catch(e){ console.warn('MQTT publish failed (kalibrasi):', e); return false; }
+                } catch(e){ 
+                    console.error(`[Kalibrasi] ❌ MQTT publish failed:`, e); 
+                    return false; 
+                }
             }
 
             // Konfigurasi path commands (ubah di sini jika ESP mendengarkan path berbeda)
@@ -745,6 +874,40 @@
                     dec !== undefined ? n.toFixed(dec) + suffix : n + suffix;
             }
 
+            // Try multiple field names for raw TDS coming from firmware
+            function getRawTds(d){
+                if (!d || typeof d !== 'object') return undefined;
+                const keys = [
+                    'tds_raw','raw_tds','tdsMentah','tds_mentah','tds_adc','adc','raw','ec_raw','ecRaw'
+                ];
+                for (const k of keys){
+                    const v = d[k];
+                    if (v !== undefined && v !== null && v !== ''){
+                        const n = Number(v);
+                        if (!Number.isNaN(n)) return n;
+                    }
+                }
+                return undefined;
+            }
+
+            // Resolve water temperature from multiple possible keys (suhu_air, suhu, temperature, temp)
+            function getWaterTemp(d){
+                if (!d || typeof d !== 'object') return undefined;
+                const keys = ['suhu_air','suhu','temperature','temp','t','suhu_udara'];
+                for (const k of keys){
+                    const v = d[k];
+                    if (v !== undefined && v !== null && v !== ''){
+                        const n = Number(v);
+                        if (!Number.isNaN(n)) return n;
+                    }
+                }
+                // lightweight diagnostics
+                if (window && window.DEBUG === true) {
+                    console.debug('[kalibrasi] getWaterTemp() not found in object keys:', Object.keys(d || {}));
+                }
+                return undefined;
+            }
+
             function setBadgeState(unit, text, style = "success") {
                 const el = document.getElementById(`state-${unit.toLowerCase()}`);
                 if (el) {
@@ -773,30 +936,58 @@
                 }
             }
 
+            // Helper to update UI for a unit using a data object
+            function updateUnitUI(unit, d){
+                const data = d || {};
+                setText(`${unit.toLowerCase()}-ph`, data.ph, 2);
+                setText(`${unit.toLowerCase()}-tds`, data.tds, 0);
+                setText(`${unit.toLowerCase()}-tds-raw`, getRawTds(data), 0);
+                setText(`${unit.toLowerCase()}-suhu`, getWaterTemp(data), 1);
+                setText(`${unit.toLowerCase()}-cal-asam`, data.cal_ph_asam, 4);
+                setText(`${unit.toLowerCase()}-cal-netral`, data.cal_ph_netral, 4);
+                setText(`${unit.toLowerCase()}-cal-tds-k`, data.cal_tds_k, 4);
+            }
+
             // Realtime listeners untuk menampilkan data & hasil kalibrasi
             function initRealtime() {
-                const paths = [
-                    { unit: "A", ref: db.ref("kebun-a/realtime") },
-                    { unit: "B", ref: db.ref("kebun-b/realtime") },
-                ];
-
-                paths.forEach(({ unit, ref }) => {
-                    ref.on("value", (snap) => {
-                        const d = snap.val() || {};
-                        setText(`${unit.toLowerCase()}-ph`, d.ph, 2);
-                        setText(`${unit.toLowerCase()}-tds`, d.tds, 0);
-                        setText(`${unit.toLowerCase()}-suhu`, d.suhu, 1);
-                        setText(`${unit.toLowerCase()}-cal-asam`, d.cal_ph_asam, 4);
-                        setText(`${unit.toLowerCase()}-cal-netral`, d.cal_ph_netral, 4);
-                        setText(`${unit.toLowerCase()}-cal-tds-k`, d.cal_tds_k, 4);
+                const units = ['A','B'];
+                units.forEach(unit => {
+                    const base = unit === 'A' ? 'kebun-a' : 'kebun-b';
+                    const refs = [ db.ref(`${base}/realtime`), db.ref(base) ];
+                    refs.forEach(ref => {
+                        ref.on('value', (snap)=>{
+                            const d = snap.val() || {};
+                            updateUnitUI(unit, d);
+                        });
                     });
                 });
             }
 
-            // Pengiriman perintah sesuai firmware Mega (via Firebase)
+            // Pengiriman perintah sesuai firmware Mega (via Firebase + MQTT)
             // Konvensi: tulis ke kebun-x/commands (push) dengan field text = string perintah
             function sendCommand(unit, text) {
                 const path = unit === "A" ? CMD_PATHS.A : CMD_PATHS.B;
+                const cmdTopic = unit === "A" ? "hidroganik/kebun-a/cmd" : "hidroganik/kebun-b/cmd";
+                
+                // Prepare command payload for MQTT
+                const mqttPayload = {
+                    type: "calibration",
+                    command: text,
+                    source: "web",
+                    timestamp: Date.now()
+                };
+                
+                // Send via MQTT first (primary method for ESP32)
+                const mqttSent = mqttPublishCalibration(unit, mqttPayload);
+                if (mqttSent) {
+                    log(`(${unit}) 📤 MQTT CMD sent: ${text}`);
+                    showToast(`(${unit}) Command sent via MQTT: ${text}`, "success", 3000);
+                } else {
+                    log(`(${unit}) ⚠️ MQTT offline, using Firebase fallback`);
+                    showToast(`(${unit}) MQTT offline, using Firebase`, "warning", 2000);
+                }
+                
+                // Also send to Firebase (backup/logging)
                 const ref = db.ref(path);
                 const payload = {
                     text, // contoh: "kalibrasi ph", "record asam 4.01", "kalibrasi tds 1413"
@@ -806,21 +997,19 @@
                 return ref
                     .push(payload)
                     .then((snap) => {
-                        log(`(${unit}) CMD dikirim: ${text}`);
+                        log(`(${unit}) 📝 Firebase CMD logged: ${text}`);
                         setFirebaseStatus("connected");
                         // Mirror ke last_command untuk memudahkan verifikasi manual
                         const mirrorPath = path.replace("/commands", "/last_command");
-                        return db.ref(mirrorPath).set({ ...payload, key: snap.key }).then(()=>{
-                            // Also publish to MQTT command topic for devices that listen via MQTT
-                            const ok = mqttPublishCalibration(unit, { type: 'calibration', text, source: 'web' });
-                            if (ok) console.log(`📤 MQTT calibration sent (${unit}):`, { text });
-                        });
+                        return db.ref(mirrorPath).set({ ...payload, key: snap.key });
                     })
                     .catch((err) => {
-                        log(`(${unit}) Gagal kirim CMD: ${err.message}`);
-                        alert("Gagal mengirim perintah: " + err.message);
+                        log(`(${unit}) ❌ Firebase error: ${err.message}`);
+                        if (!mqttSent) {
+                            alert("Gagal mengirim perintah: " + err.message);
+                            showToast(`(${unit}) Gagal: ${err.message}`, "error", 5000);
+                        }
                         setFirebaseStatus("error", err.message);
-                        showToast(`(${unit}) Gagal: ${err.message}`, "error", 5000);
                     });
             }
 
@@ -989,13 +1178,48 @@
             window.recordPhNetral = recordPhNetral;
             window.calibrateTds = calibrateTds;
             window.finishCalibration = finishCalibration;
+            
+            // Debugging helpers
+            window.getMQTTStatus = function() {
+                const status = {
+                    initialized: mqttClient !== null,
+                    connected: mqttConnected,
+                    clientConnected: mqttClient?.connected || false,
+                    broker: MQTT_WS_URL
+                };
+                console.log("📊 MQTT Status (Kalibrasi):", status);
+                log(`📊 MQTT: ${status.connected ? 'Connected' : 'Disconnected'} to ${status.broker}`);
+                return status;
+            };
+            
+            window.testCalibrationCommand = function(unit = 'A') {
+                const testCmd = {
+                    type: "calibration",
+                    command: "test command",
+                    source: "web-test",
+                    timestamp: Date.now()
+                };
+                const result = mqttPublishCalibration(unit, testCmd);
+                console.log(`🧪 Test command sent to Kebun ${unit}:`, result ? 'Success' : 'Failed');
+                if (result) {
+                    showToast(`Test command sent to Kebun ${unit}`, "success");
+                } else {
+                    showToast(`Failed to send test command to Kebun ${unit}`, "error");
+                }
+                return result;
+            };
+            
+            console.log("📝 Debug functions available:");
+            console.log("  getMQTTStatus() - Check MQTT connection");
+            console.log("  testCalibrationCommand('A') - Test command to Kebun A");
+            console.log("  testCalibrationCommand('B') - Test command to Kebun B");
 
             // Init
             document.addEventListener("DOMContentLoaded", () => {
                 initClock();
                 initCompanyLogo();
-                initRealtime();
-                initMqttCal();
+                if (DATA_SOURCE !== 'mqtt') initRealtime();
+                if (DATA_SOURCE !== 'firebase') initMqttCal();
                 heartbeatTest();
                 log("Halaman kalibrasi siap");
             });

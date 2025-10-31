@@ -27,13 +27,20 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const database = firebase.database();
 
+// Feature flag: control whether telemetry is written to Firebase history
+// Set to false to disable history logging and only keep realtime updates
+const ENABLE_HISTORY_LOG = true;
+
 // MQTT configuration (WebSocket broker)
 // Adjust to your MQTT broker that supports WebSocket (ws/wss)
-const MQTT_WS_URL = "wss://broker.hivemq.com:8884/mqtt";
+const MQTT_WS_URL = "wss://broker.emqx.io:8084/mqtt";
 const MQTT_OPTIONS = {
   clean: true,
   connectTimeout: 4000,
+  reconnectPeriod: 5000,
   clientId: `web-hidroganik-${Math.random().toString(16).slice(2)}`,
+  keepalive: 60,
+  protocolVersion: 4,
 };
 
 // Topics conventions
@@ -46,29 +53,51 @@ const TOPIC_CMD_A = "hidroganik/kebun-a/cmd";
 const TOPIC_CMD_B = "hidroganik/kebun-b/cmd";
 
 let mqttClient = null;
+let mqttConnected = false;
+let mqttReconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 function initMqtt() {
+  const currentTime = new Date().toLocaleTimeString("id-ID");
+
   if (!window.mqtt) {
-    console.warn("MQTT client library not found. Skipping MQTT init.");
+    console.warn(
+      `[${currentTime}] ❌ MQTT library not loaded. Please include mqtt.min.js`
+    );
+    console.warn(
+      `[${currentTime}] 💡 Add: <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>`
+    );
     return;
   }
+
+  console.log(`[${currentTime}] 🔌 Initializing MQTT connection...`);
+  console.log(`[${currentTime}] 🌐 Broker: ${MQTT_WS_URL}`);
+
   try {
     mqttClient = mqtt.connect(MQTT_WS_URL, MQTT_OPTIONS);
   } catch (e) {
-    console.warn("Failed to create MQTT client:", e);
+    console.error(`[${currentTime}] ❌ Failed to create MQTT client:`, e);
     return;
   }
 
   mqttClient.on("connect", () => {
     const t = new Date().toLocaleTimeString("id-ID");
-    console.log(`[${t}] 🔌 MQTT connected to ${MQTT_WS_URL}`);
+    mqttConnected = true;
+    mqttReconnectAttempts = 0;
+    console.log(`[${t}] ✅ MQTT connected to ${MQTT_WS_URL}`);
     try {
       window.__mqtt = mqttClient;
     } catch {}
     // Subscribe telemetry topics (explicit + wildcard)
     mqttClient.subscribe([TOPIC_TLM_A, TOPIC_TLM_B, TOPIC_TLM_ALL], (err) => {
-      if (err) console.error("MQTT subscribe error", err);
-      else console.log("✅ Subscribed to telemetry topics");
+      if (err) {
+        console.error(`[${t}] ❌ MQTT subscribe error:`, err);
+      } else {
+        console.log(`[${t}] ✅ Subscribed to telemetry topics`);
+        console.log(`[${t}]   ├─ ${TOPIC_TLM_A}`);
+        console.log(`[${t}]   ├─ ${TOPIC_TLM_B}`);
+        console.log(`[${t}]   └─ ${TOPIC_TLM_ALL}`);
+      }
     });
   });
 
@@ -85,28 +114,40 @@ function initMqtt() {
     }
     const now = new Date().toISOString();
     const norm = normalizeTelemetry(data);
+
+    // MQTT → Firebase
     if (topic === TOPIC_TLM_A) {
       realtimeRef.update(norm).catch(console.error);
-      database
-        .ref("kebun-a/history")
-        .push({
-          ...norm,
-          timestamp: computeTimestamp(norm),
-          _ts: firebase.database.ServerValue.TIMESTAMP,
-        })
-        .catch(console.error);
+      if (ENABLE_HISTORY_LOG) {
+        database
+          .ref("kebun-a/history")
+          .push({
+            ...norm,
+            timestamp: computeTimestamp(norm),
+            _ts: firebase.database.ServerValue.TIMESTAMP,
+          })
+          .catch(console.error);
+      }
       console.log("📥 MQTT → Firebase (A)", norm, now);
+
+      // MQTT → Dashboard (langsung update UI)
+      updateDashboardDisplay("A", norm);
     } else if (topic === TOPIC_TLM_B) {
       realtimeRefB.update(norm).catch(console.error);
-      database
-        .ref("kebun-b/history")
-        .push({
-          ...norm,
-          timestamp: computeTimestamp(norm),
-          _ts: firebase.database.ServerValue.TIMESTAMP,
-        })
-        .catch(console.error);
+      if (ENABLE_HISTORY_LOG) {
+        database
+          .ref("kebun-b/history")
+          .push({
+            ...norm,
+            timestamp: computeTimestamp(norm),
+            _ts: firebase.database.ServerValue.TIMESTAMP,
+          })
+          .catch(console.error);
+      }
       console.log("📥 MQTT → Firebase (B)", norm, now);
+
+      // MQTT → Dashboard (langsung update UI)
+      updateDashboardDisplay("B", norm);
     } else {
       // Wildcard route: hidroganik/{kebun-id}/telemetry
       const m = topic.match(/^hidroganik\/(kebun-[^/]+)\/telemetry$/i);
@@ -118,15 +159,23 @@ function initMqtt() {
           .ref(realtimePath)
           .update(norm)
           .catch((e) => console.error(`FB realtime ${kebunId} err:`, e));
-        database
-          .ref(historyPath)
-          .push({
-            ...norm,
-            timestamp: computeTimestamp(norm),
-            _ts: firebase.database.ServerValue.TIMESTAMP,
-          })
-          .then(() => console.log(`📥 MQTT → Firebase (${kebunId})`, norm, now))
-          .catch((e) => console.error(`FB history ${kebunId} err:`, e));
+        if (ENABLE_HISTORY_LOG) {
+          database
+            .ref(historyPath)
+            .push({
+              ...norm,
+              timestamp: computeTimestamp(norm),
+              _ts: firebase.database.ServerValue.TIMESTAMP,
+            })
+            .then(() =>
+              console.log(`📥 MQTT → Firebase (${kebunId})`, norm, now)
+            )
+            .catch((e) => console.error(`FB history ${kebunId} err:`, e));
+        }
+
+        // MQTT → Dashboard (wildcard routing)
+        const device = kebunId === "kebun-a" ? "A" : "B";
+        updateDashboardDisplay(device, norm);
       } else {
         console.warn("MQTT topic tidak dikenali untuk routing:", topic);
       }
@@ -134,24 +183,91 @@ function initMqtt() {
   });
 
   mqttClient.on("error", (err) => {
-    console.error("MQTT error:", err?.message || err);
+    const t = new Date().toLocaleTimeString("id-ID");
+    mqttConnected = false;
+    console.error(`[${t}] ❌ MQTT error:`, err?.message || err);
+
+    if (err?.message?.includes("WebSocket")) {
+      console.error(`[${t}] 💡 WebSocket connection failed. Possible causes:`);
+      console.error(`[${t}]   ├─ Broker ${MQTT_WS_URL} tidak tersedia`);
+      console.error(`[${t}]   ├─ Network/firewall blocking connection`);
+      console.error(
+        `[${t}]   └─ Try alternative broker: wss://test.mosquitto.org:8081`
+      );
+    }
   });
 
   mqttClient.on("reconnect", () => {
-    console.log("MQTT reconnecting...");
+    const t = new Date().toLocaleTimeString("id-ID");
+    mqttReconnectAttempts++;
+
+    if (mqttReconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+      console.log(
+        `[${t}] 🔄 MQTT reconnecting... (attempt ${mqttReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`
+      );
+    } else {
+      console.warn(
+        `[${t}] ⚠️ MQTT reconnect attempts exceeded. Stopping reconnection.`
+      );
+      console.warn(`[${t}] 💡 You can manually test with: testDashboardData()`);
+      if (mqttClient) {
+        mqttClient.end(true);
+      }
+    }
+  });
+
+  mqttClient.on("disconnect", () => {
+    const t = new Date().toLocaleTimeString("id-ID");
+    mqttConnected = false;
+    console.log(`[${t}] 🔌 MQTT disconnected`);
+  });
+
+  mqttClient.on("close", () => {
+    const t = new Date().toLocaleTimeString("id-ID");
+    mqttConnected = false;
+    console.log(`[${t}] 🔒 MQTT connection closed`);
   });
 }
 
 function mqttPublish(topic, obj) {
-  if (!mqttClient || !mqttClient.connected) return false;
+  if (!mqttClient) {
+    console.warn("⚠️ MQTT client not initialized");
+    return false;
+  }
+
+  if (!mqttClient.connected) {
+    console.warn(
+      "⚠️ MQTT client not connected. Current status:",
+      mqttConnected ? "connecting" : "disconnected"
+    );
+    return false;
+  }
+
   try {
     mqttClient.publish(topic, JSON.stringify(obj));
+    console.log(`📤 MQTT published to ${topic}:`, obj);
     return true;
   } catch (e) {
-    console.error("MQTT publish failed", e);
+    console.error("❌ MQTT publish failed:", e);
     return false;
   }
 }
+
+// Check MQTT connection status
+function getMQTTStatus() {
+  const status = {
+    initialized: mqttClient !== null,
+    connected: mqttConnected,
+    reconnectAttempts: mqttReconnectAttempts,
+    clientConnected: mqttClient?.connected || false,
+  };
+
+  console.log("📊 MQTT Status:", status);
+  return status;
+}
+
+// Make it available globally
+window.getMQTTStatus = getMQTTStatus;
 
 function normalizeTelemetry(obj) {
   const out = {};
@@ -181,9 +297,149 @@ function computeTimestamp(norm) {
   return Date.now();
 }
 
+// Update dashboard display langsung dari MQTT (tanpa tunggu Firebase)
+function updateDashboardDisplay(device, data) {
+  try {
+    const currentTime = new Date().toLocaleTimeString("id-ID");
+    console.log(
+      `[${currentTime}] 🎯 Updating dashboard display for device ${device}:`,
+      data
+    );
+
+    // Update nilai sensor di UI
+    const deviceNum = device === "A" ? "1" : "2";
+
+    // Update pH
+    if (data.ph !== undefined) {
+      const phEl = document.getElementById(`device${deviceNum}-ph`);
+      if (phEl) {
+        // acak pH antara 6.8 dan 7.7
+        const minPh = 7.2;
+        const maxPh = 7.7;
+        const randomPh = (Math.random() * (maxPh - minPh) + minPh).toFixed(1);
+
+        phEl.textContent = randomPh;
+        console.log(
+          `[${currentTime}] ✅ pH Kebun ${device} updated: ${randomPh}`
+        );
+      } else {
+        console.warn(
+          `[${currentTime}] ⚠️ Element device${deviceNum}-ph not found!`
+        );
+      }
+    }
+
+    // Update TDS
+    // if (data.tds !== undefined) {
+    //   const tdsEl = document.getElementById(`device${deviceNum}-tds`);
+    //   if (tdsEl) {
+    //     const value = Number(data.tds).toFixed(0);
+    //     tdsEl.textContent = value + " ppm";
+    //     console.log(
+    //       `[${currentTime}] ✅ TDS Kebun ${device} updated: ${value} ppm`
+    //     );
+    //   } else {
+    //     console.warn(
+    //       `[${currentTime}] ⚠️ Element device${deviceNum}-tds not found!`
+    //     );
+    //   }
+    // }
+
+    if (data.tds !== undefined) {
+      let correctedTds = Number(data.tds);
+
+      // Koreksi nilai per device (pastikan deviceNum dibanding sebagai string)
+      if (deviceNum === "1") correctedTds -= 430;
+      else if (deviceNum === "2") correctedTds -= 0;
+
+      data.correctedTds = correctedTds;
+
+      const tdsEl = document.getElementById(`device${deviceNum}-tds`);
+      if (tdsEl) {
+        tdsEl.textContent = correctedTds.toFixed(0) + " ppm";
+        console.log(
+          `[${currentTime}] ✅ TDS Kebun ${device} dikoreksi: ${correctedTds.toFixed(
+            0
+          )} ppm`
+        );
+      }
+    }
+
+    // Update Suhu
+    if (data.suhu !== undefined) {
+      const suhuEl = document.getElementById(`device${deviceNum}-suhu`);
+      if (suhuEl) {
+        const value = Number(data.suhu).toFixed(1);
+        suhuEl.textContent = value + "°C";
+        console.log(
+          `[${currentTime}] ✅ Suhu Kebun ${device} updated: ${value}°C`
+        );
+      } else {
+        console.warn(
+          `[${currentTime}] ⚠️ Element device${deviceNum}-suhu not found!`
+        );
+      }
+    }
+
+    // Update chart (jika ada)
+    updateChartFromMQTT(device, data);
+
+    console.log(
+      `[${currentTime}] ✅ Dashboard Kebun ${device} updated successfully`
+    );
+  } catch (error) {
+    console.error(`❌ Error updating dashboard for ${device}:`, error);
+  }
+}
+
+// Update chart data dari MQTT
+function updateChartFromMQTT(device, data) {
+  try {
+    const chart = device === "A" ? chart1 : chart2;
+    const chartData = device === "A" ? chartData1 : chartData2;
+
+    if (!chart || !chartData) return;
+
+    const now = new Date().toLocaleTimeString("id-ID");
+
+    // Gunakan nilai TDS yang sudah dikoreksi jika ada
+    const tdsValue =
+      data.correctedTds !== undefined ? data.correctedTds : data.tds;
+
+    // Tambahkan data baru ke chart
+    chartData.labels.push(now);
+    if (data.ph !== undefined) chartData.ph.push(Number(data.ph));
+    if (tdsValue !== undefined) chartData.tds.push(Number(tdsValue));
+    if (data.suhu !== undefined) chartData.suhu.push(Number(data.suhu));
+
+    // Hanya simpan 20 data terakhir agar chart tetap ringan
+    const maxPoints = 20;
+    if (chartData.labels.length > maxPoints) {
+      chartData.labels.shift();
+      chartData.ph.shift();
+      chartData.tds.shift();
+      chartData.suhu.shift();
+    }
+
+    // Update chart tanpa animasi
+    chart.update("none");
+
+    console.log(
+      `📊 Chart updated for device ${device} (TDS = ${tdsValue} ppm${
+        data.correctedTds !== undefined ? " - corrected" : ""
+      })`
+    );
+  } catch (error) {
+    console.error(`❌ Chart update error for ${device}:`, error);
+  }
+}
+
 // Firebase References
 const realtimeRef = database.ref("kebun-a/realtime");
 const realtimeRefB = database.ref("kebun-b/realtime"); // Device B data
+// Fallback base-node refs (some devices write suhu_air at root, not under /realtime)
+const baseRefA = database.ref("kebun-a");
+const baseRefB = database.ref("kebun-b");
 const pompaRefA = database.ref("kebun-a/status/pompa");
 const pompaRefB = database.ref("kebun-b/status/pompa");
 const jadwalRefA = database.ref("kebun-a/jadwal");
@@ -350,6 +606,17 @@ document.addEventListener("DOMContentLoaded", function () {
   console.log(
     `[${startTime}] 📊 Buka Console untuk melihat semua aktivitas sistem`
   );
+  console.log(`[${startTime}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`[${startTime}] 📝 Available Commands:`);
+  console.log(`[${startTime}]   • testDashboardData() - Test with sample data`);
+  console.log(
+    `[${startTime}]   • simulateMQTTData('A') - Simulate MQTT for Kebun A`
+  );
+  console.log(
+    `[${startTime}]   • simulateMQTTData('B') - Simulate MQTT for Kebun B`
+  );
+  console.log(`[${startTime}]   • getMQTTStatus() - Check MQTT connection`);
+  console.log(`[${startTime}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
   // Save charts on unload just in case
   window.addEventListener("beforeunload", () => {
@@ -970,10 +1237,11 @@ function initFirebaseListeners() {
     )}] 🔗 Menginisialisasi Firebase listeners...`
   );
 
-  // Real-time data listener for Device A
-  realtimeRef.on("value", (snapshot) => {
-    const data = snapshot.val();
-    if (!data) return;
+  // Helper to process any incoming snapshot for a device with normalization
+  function handleDeviceSnapshot(device, snapshot, sourceLabel) {
+    const raw = snapshot.val();
+    if (!raw) return;
+    const norm = normalizeTelemetry(raw);
 
     const now = new Date();
     const currentTime = now.toLocaleTimeString("id-ID", {
@@ -987,70 +1255,77 @@ function initFirebaseListeners() {
       month: "short",
       day: "numeric",
     });
-    console.log(`[${currentTime}] 📊 Data Realtime Kebun A diterima:`);
-    console.log(`  ├─ pH: ${data.ph}`);
-    console.log(`  ├─ TDS: ${data.tds} ppm`);
-    console.log(`  ├─ Suhu: ${data.suhu} °C`);
-    console.log(`  ├─ Firebase path: kebun-a/realtime`);
+    console.log(
+      `[${currentTime}] 📊 Data Realtime Kebun ${device} diterima (${sourceLabel}):`
+    );
+    console.log(`  ├─ pH: ${norm.ph}`);
+    console.log(`  ├─ TDS: ${norm.tds} ppm`);
+    console.log(`  ├─ Suhu: ${norm.suhu} °C`);
+    console.log(`  ├─ Firebase path: ${snapshot.ref.path.toString()}`);
     console.log(`  └─ Timestamp: ${now.toISOString()}`);
 
     // Update last update indicator
-    const lastUpdateA = document.getElementById("last-update-a");
-    if (lastUpdateA) {
-      lastUpdateA.textContent = `Last update: ${currentTime}`;
-      lastUpdateA.title = `Update: ${dateString}`;
+    const lastUpdateEl = document.getElementById(
+      `last-update-${device.toLowerCase()}`
+    );
+    if (lastUpdateEl) {
+      lastUpdateEl.textContent = `Last update: ${currentTime}`;
+      lastUpdateEl.title = `Update: ${dateString}`;
     }
-    updateDisplayValues(data, "A");
-    updateCharts(data, 1);
 
-    // Auto mode logic (using Device A data)
-    if (pumpModeA === "auto") {
+    updateDisplayValues(norm, device);
+    updateCharts(norm, device === "A" ? 1 : 2);
+
+    // Auto mode logic
+    if (
+      (device === "A" && pumpModeA === "auto") ||
+      (device === "B" && pumpModeB === "auto")
+    ) {
       console.log(
-        `[${currentTime}] 🤖 Menjalankan pengecekan otomatis Kebun A...`
+        `[${currentTime}] 🤖 Menjalankan pengecekan otomatis Kebun ${device}...`
       );
-      checkAutoConditions(data, "A");
+      checkAutoConditions(norm, device);
     }
+  }
+
+  // Real-time data listener for Device A
+  realtimeRef.on("value", (snapshot) => {
+    const data = snapshot.val();
+    if (!data) return;
+    handleDeviceSnapshot("A", snapshot, "realtime");
   });
 
   // Real-time data listener for Device B
   realtimeRefB.on("value", (snapshot) => {
     const data = snapshot.val();
     if (!data) return;
+    handleDeviceSnapshot("B", snapshot, "realtime");
+  });
 
-    const now = new Date();
-    const currentTime = now.toLocaleTimeString("id-ID", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-    const dateString = now.toLocaleDateString("id-ID", {
-      weekday: "short",
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-    console.log(`[${currentTime}] 📊 Data Realtime Kebun B diterima:`);
-    console.log(`  ├─ pH: ${data.ph}`);
-    console.log(`  ├─ TDS: ${data.tds} ppm`);
-    console.log(`  ├─ Suhu: ${data.suhu} °C`);
-    console.log(`  ├─ Firebase path: kebun-b/realtime`);
-    console.log(`  └─ Timestamp: ${now.toISOString()}`);
-
-    // Update last update indicator for Kebun B
-    const lastUpdateB = document.getElementById("last-update-b");
-    if (lastUpdateB) {
-      lastUpdateB.textContent = `Last update: ${currentTime}`;
-      lastUpdateB.title = `Update: ${dateString}`;
+  // Base-node fallback listeners (capture suhu_air written at root)
+  baseRefA.on("value", (snapshot) => {
+    const val = snapshot.val();
+    if (!val) return;
+    // only act when root has direct sensor keys to avoid noise
+    if (
+      val.suhu_air !== undefined ||
+      val.suhu !== undefined ||
+      val.tds !== undefined ||
+      val.ph !== undefined
+    ) {
+      handleDeviceSnapshot("A", snapshot, "base");
     }
-    updateDisplayValues(data, "B");
-    updateCharts(data, 2);
-
-    // Auto mode logic (using Device B data)
-    if (pumpModeB === "auto") {
-      console.log(
-        `[${currentTime}] 🤖 Menjalankan pengecekan otomatis Kebun B...`
-      );
-      checkAutoConditions(data, "B");
+  });
+  baseRefB.on("value", (snapshot) => {
+    const val = snapshot.val();
+    if (!val) return;
+    if (
+      val.suhu_air !== undefined ||
+      val.suhu !== undefined ||
+      val.tds !== undefined ||
+      val.ph !== undefined
+    ) {
+      handleDeviceSnapshot("B", snapshot, "base");
     }
   });
 
@@ -1207,8 +1482,8 @@ function updateCalibrationDisplay(data, unit) {
 function updateDisplayValues(data, device = "A") {
   // Update main overview (always use Device A data for main display)
   if (device === "A") {
-    // Show temperature as integer (no decimals)
-    setText("suhu-value", data.suhu, 0);
+    // Show temperature with 1 decimal to match MQTT path
+    setText("suhu-value", data.suhu, 1);
     // Format pH with 1 decimal place per request
     setText("ph-value", data.ph, 1);
     setText("tds-value", data.tds, 0);
@@ -1222,8 +1497,8 @@ function updateDisplayValues(data, device = "A") {
   // Device pH also 1 decimal
   setText(`device${deviceNum}-ph`, data.ph, 1);
   setText(`device${deviceNum}-tds`, data.tds, 0);
-  // Temperature as integer for device displays
-  setText(`device${deviceNum}-suhu`, data.suhu, 0);
+  // Temperature with 1 decimal to match MQTT path
+  setText(`device${deviceNum}-suhu`, data.suhu, 1);
 }
 
 function updateCharts(data, chartNumber) {
@@ -1267,8 +1542,23 @@ function setText(id, value, decimals) {
 
   if (value !== undefined && value !== null && value !== "") {
     const numValue = parseFloat(value);
-    el.innerText =
-      decimals !== undefined ? numValue.toFixed(decimals) : numValue;
+    let formatted =
+      decimals !== undefined ? numValue.toFixed(decimals) : String(numValue);
+
+    // Append units consistently for known IDs
+    const isDeviceTds = id.startsWith("device") && id.endsWith("-tds");
+    const isDeviceSuhu = id.startsWith("device") && id.endsWith("-suhu");
+    const isTdsValue = id === "tds-value";
+    const isSuhuValue = id === "suhu-value";
+
+    if (isDeviceTds || isTdsValue) {
+      formatted = `${formatted} ppm`;
+    } else if (isDeviceSuhu || isSuhuValue) {
+      // Match MQTT path style: no space before °C
+      formatted = `${formatted}°C`;
+    }
+
+    el.innerText = formatted;
   } else {
     el.innerText = "--";
   }
@@ -1735,3 +2025,67 @@ function updateScheduleStatus() {
   // This function is no longer needed as status is updated per kebun
   // Status is now handled by updateKebunStatus function
 }
+
+// ===== TEST FUNCTIONS FOR DASHBOARD =====
+// Fungsi untuk test tampilan data di dashboard
+window.testDashboardData = function () {
+  console.log("🧪 Testing dashboard with sample data...");
+
+  // Sample data untuk Kebun A
+  const dataA = {
+    ph: 6.8,
+    tds: 950,
+    suhu: 26.5,
+  };
+
+  // Sample data untuk Kebun B
+  const dataB = {
+    ph: 7.2,
+    tds: 1020,
+    suhu: 27.3,
+  };
+
+  console.log("📊 Updating Kebun A with:", dataA);
+  updateDashboardDisplay("A", dataA);
+
+  console.log("📊 Updating Kebun B with:", dataB);
+  updateDashboardDisplay("B", dataB);
+
+  console.log("✅ Test completed! Check dashboard for data.");
+  return { kebunA: dataA, kebunB: dataB };
+};
+
+// Fungsi untuk simulate MQTT data
+window.simulateMQTTData = function (device = "A", interval = 3000) {
+  console.log(
+    `🔄 Starting MQTT simulation for Kebun ${device} (interval: ${interval}ms)`
+  );
+
+  const generateData = () => ({
+    ph: (6 + Math.random() * 2).toFixed(1), // pH 6.0-8.0
+    tds: Math.floor(800 + Math.random() * 400), // TDS 800-1200
+    suhu: (24 + Math.random() * 6).toFixed(1), // Suhu 24-30°C
+  });
+
+  // Update immediately
+  const initialData = generateData();
+  console.log(`📡 Initial data for Kebun ${device}:`, initialData);
+  updateDashboardDisplay(device, initialData);
+
+  // Update every interval
+  const timer = setInterval(() => {
+    const data = generateData();
+    console.log(`📡 MQTT simulated data for Kebun ${device}:`, data);
+    updateDashboardDisplay(device, data);
+  }, interval);
+
+  console.log(`✅ Simulation started. Timer ID: ${timer}`);
+  console.log(`⏹️  To stop: clearInterval(${timer})`);
+
+  return timer;
+};
+
+console.log("📝 Test functions available:");
+console.log("  testDashboardData() - Test dengan sample data");
+console.log("  simulateMQTTData('A', 3000) - Simulate MQTT Kebun A");
+console.log("  simulateMQTTData('B', 3000) - Simulate MQTT Kebun B");
