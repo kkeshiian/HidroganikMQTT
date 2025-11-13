@@ -82,19 +82,18 @@
                 <tbody id="log-table-body"></tbody>
             </table>
         </div>
-        <div id="loading-indicator" class="flex flex-col items-center justify-center py-16">
-            <span class="loading loading-spinner loading-lg text-success"></span>
-            <div class="mt-4 text-center">
-                <p class="text-base-content font-medium">Memuat data logger...</p>
-                <p class="text-base-content/60 text-sm mt-2">Mengambil data dari Firebase</p>
-            </div>
-        </div>
-        <div id="no-data-message" class="hidden">
+                <div id="loading-indicator" class="flex flex-col items-center justify-center py-16 hidden">
+                        <span class="loading loading-spinner loading-lg text-success"></span>
+                        <div class="mt-4 text-center">
+                                <p class="text-base-content font-medium">Memuat data logger...</p>
+                        </div>
+                </div>
+                <div id="no-data-message" class="hidden">
             <div class="hero min-h-[200px]">
                 <div class="hero-content text-center">
                     <div class="text-6xl mb-4">📭</div>
                     <h1 class="text-2xl font-bold text-base-content">Tidak ada data</h1>
-                    <p class="py-4 text-base-content/70">Tidak ada data yang ditemukan untuk filter yang dipilih</p>
+                                        <p class="py-4 text-base-content/70">Tidak ada data yang ditemukan untuk filter yang dipilih</p>
                     <button class="btn btn-primary" onclick="loadLogData()">🔄 Coba Lagi</button>
                 </div>
             </div>
@@ -114,288 +113,236 @@
 <?= $this->endSection() ?>
 <?= $this->section('body_end') ?>
 <script>
-// Guard Firebase compat if already present (dashboard loads v9 compat)
-if (typeof firebase === 'undefined' || !firebase.apps || !firebase.apps.length) {
-    // assume loaded in layout if needed; if not, user must add scripts
-}
-const firebaseConfigLog = {
-    apiKey: "AIzaSyCFx2ZlJRGZfD-P6I84a53yc8D_cyFqvgs",
-    authDomain: "hidroganik-monitoring.firebaseapp.com",
-    databaseURL: "https://hidroganik-monitoring-default-rtdb.asia-southeast1.firebasedatabase.app",
-    projectId: "hidroganik-monitoring",
-    storageBucket: "hidroganik-monitoring.firebasestorage.app",
-    messagingSenderId: "103705402081",
-    appId: "1:103705402081:web:babc15ad263749e80535a0"
-};
-try { if (!firebase.apps.length) { firebase.initializeApp(firebaseConfigLog); } } catch(e) { console.warn('Firebase init log page:', e); }
-const dbLog = firebase.database();
-
-let logDataCache = [];
+// Log page powered by MySQL via /api/telemetry
 let currentPage = 1;
-const itemsPerPage = 50; // logical page size (for stats + CSV)
-let sortColumn = 'timestamp';
-let sortDirection = 'desc';
-// Removed lazy loading logic
-let renderedCount = 0; // how many rows actually painted to DOM
-const CHUNK_SIZE = 100; // rows per lazy render chunk
-let isRenderingChunk = false;
-// Live listeners registry
-let liveListenerHandles = [];
-
-// Debounce utility
-function debounce(fn, delay=500){ let t; return function(...a){ clearTimeout(t); t=setTimeout(()=>fn.apply(this,a),delay); }; }
-
-function loadLogData() {
-    const loadingIndicator = document.getElementById('loading-indicator');
-    const noDataMessage = document.getElementById('no-data-message');
-    const tableBody = document.getElementById('log-table-body');
-    const pagination = document.getElementById('pagination');
-    loadingIndicator.classList.remove('hidden');
-    noDataMessage.classList.add('hidden');
-    pagination.classList.add('hidden');
-    tableBody.innerHTML = '';
-    // Detach any existing live listeners when reloading with new filters
-    detachLiveListeners();
-    const startDateInput = document.getElementById('start-date');
-    const endDateInput = document.getElementById('end-date');
-    const deviceFilter = document.getElementById('device-filter').value;
-    if (!startDateInput.value || !endDateInput.value) {
-        const endDate = new Date();
-        const startDate = new Date();
-        startDate.setDate(startDate.getDate() - 7);
-        startDateInput.value = startDate.toISOString().split('T')[0];
-        endDateInput.value = endDate.toISOString().split('T')[0];
-    }
-    const startDate = new Date(startDateInput.value);
-    const endDate = new Date(endDateInput.value + ' 23:59:59');
-    loadFromRealtimeData(startDate, endDate, deviceFilter);
-}
-
-function loadFromRealtimeData(startDate, endDate, deviceFilter) {
-    const devices = deviceFilter === 'all' ? ['a','b'] : [deviceFilter.toLowerCase()];
-    const startMs = startDate.getTime();
-    const endMs = endDate.getTime();
-    let allData = []; let loadedDevices = 0;
-    devices.forEach(device => {
-        let queryRef = dbLog.ref(`kebun-${device}/history`).orderByChild('timestamp').startAt(startMs).endAt(endMs);
-        queryRef.once('value').then(snapshot => {
-            if (!snapshot.exists()) {
-                return dbLog.ref(`kebun-${device}/history`).once('value').then(fullSnap => {
-                    if (fullSnap.exists()) { fullSnap.forEach(ch => processChild(device,ch)); }
-                });
-            } else { snapshot.forEach(ch => processChild(device,ch)); }
-        }).catch(err => { console.error('Query error', device, err); }).finally(()=>{ loadedDevices++; if (loadedDevices===devices.length) finalize(); });
-    });
-    function processChild(device, child) {
-        const data = child.val();
-        let ts = null;
-        if (typeof data.timestamp === 'number') ts = data.timestamp;
-        else if (typeof data.timestamp === 'string' && !isNaN(+data.timestamp)) ts = +data.timestamp;
-        else if (typeof data.createdAt === 'number') ts = data.createdAt;
-        else if (data.date && data.time) { const dt = new Date(`${data.date} ${data.time}`); if (!isNaN(dt.getTime())) ts = dt.getTime(); }
-        if (ts === null) return; if (ts < startMs || ts > endMs) return;
-        allData.push({
-            id: child.key,
-            timestamp: ts,
-            device: device.toUpperCase(),
-            ph: parseFloat(data.ph) || 0,
-            tds: parseInt(data.tds) || 0,
-            temperature: parseFloat(data.suhu ?? data.temperature) || 0,
-            cal_ph_asam: parseFloat(data.cal_ph_asam) || 0,
-            cal_ph_netral: parseFloat(data.cal_ph_netral) || 0,
-            cal_tds_k: parseFloat(data.cal_tds_k) || 0
-        });
-    }
-    function finalize() {
-        logDataCache = allData;
-        sortCache();
-        displayLogData(logDataCache); updateStatistics(logDataCache);
-        document.getElementById('loading-indicator').classList.add('hidden');
-        if (!logDataCache.length) document.getElementById('no-data-message').classList.remove('hidden');
-        else { document.getElementById('pagination').classList.remove('hidden'); updatePagination(); }
-        // Attach live listeners for new incoming history entries within the current range
-        attachLiveListeners(devices, startMs, endMs);
-    }
-}
-
-function clearRenderedRows(){ const tb=document.getElementById('log-table-body'); tb.innerHTML=''; renderedCount=0; }
-function displayLogData(data){
-    const tb=document.getElementById('log-table-body');
-    tb.innerHTML='';
-    const startIndex=(currentPage-1)*itemsPerPage;
-    const endIndex=Math.min(startIndex+itemsPerPage,data.length);
-    const pageData=data.slice(startIndex,endIndex);
-    const frag=document.createDocumentFragment();
-    pageData.forEach(row=>{
-        const tr=document.createElement('tr'); tr.className='table-row hover:bg-gray-50';
-        const date=new Date(row.timestamp); const formattedDate=date.toLocaleString('id-ID');
-        tr.innerHTML=`<td class="px-4 py-3 text-sm">${formattedDate}</td>
-            <td class="px-4 py-3 text-sm"><span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${row.device==='A'?'bg-blue-100 text-blue-800':'bg-purple-100 text-purple-800'}">${row.device}</span></td>
-            <td class="px-4 py-3 text-sm font-mono">${row.ph.toFixed(1)}</td>
-            <td class="px-4 py-3 text-sm font-mono">${Math.round(row.tds)} ppm</td>
-            <td class="px-4 py-3 text-sm font-mono">${row.temperature.toFixed(1)}°C</td>
-            <td class="px-4 py-3 text-sm font-mono">${row.cal_ph_asam.toFixed(4)}</td>
-            <td class="px-4 py-3 text-sm font-mono">${row.cal_ph_netral.toFixed(4)}</td>
-            <td class="px-4 py-3 text-sm font-mono">${row.cal_tds_k.toFixed(4)}</td>`;
-        frag.appendChild(tr);
-    });
-    tb.appendChild(frag);
-    document.getElementById('data-count').textContent=data.length;
-}
-
-function updateStatistics(data) {
-    if (!data.length) { document.getElementById('total-records').textContent='0';document.getElementById('avg-ph').textContent='0.0';document.getElementById('avg-tds').textContent='0';document.getElementById('avg-temp').textContent='0.0°C';return; }
-    const totalRecords = data.length;
-    const avgPh = data.reduce((s,i)=>s+i.ph,0)/totalRecords;
-    const avgTds = data.reduce((s,i)=>s+i.tds,0)/totalRecords;
-    const avgTemp = data.reduce((s,i)=>s+i.temperature,0)/totalRecords;
-    document.getElementById('total-records').textContent = totalRecords.toLocaleString();
-    document.getElementById('avg-ph').textContent = avgPh.toFixed(1);
-    document.getElementById('avg-tds').textContent = Math.round(avgTds).toLocaleString();
-    document.getElementById('avg-temp').textContent = avgTemp.toFixed(1)+'°C';
-}
-
-function updatePagination() {
-    const totalPages = Math.ceil(logDataCache.length / itemsPerPage);
-    const startItem = (currentPage - 1) * itemsPerPage + 1;
-    const endItem = Math.min(currentPage * itemsPerPage, logDataCache.length);
-    document.getElementById('showing-from').textContent = startItem;
-    document.getElementById('showing-to').textContent = endItem;
-    document.getElementById('total-entries').textContent = logDataCache.length;
-    document.getElementById('prev-page').disabled = currentPage === 1;
-    document.getElementById('next-page').disabled = currentPage === totalPages;
-}
-function changePage(dir) { const totalPages = Math.ceil(logDataCache.length / itemsPerPage); const newPage = currentPage + dir; if (newPage>=1 && newPage<=totalPages){ currentPage=newPage; displayLogData(logDataCache); updatePagination(); } }
-
-function sortTable(column) {
-    if (sortColumn===column) sortDirection = sortDirection==='asc'?'desc':'asc'; else { sortColumn=column; sortDirection='desc'; }
-    sortCache();
-    currentPage=1; displayLogData(logDataCache); updatePagination();
-}
-
-// Keep cache sorted according to current sort settings
-function sortCache(){
-    logDataCache.sort((a,b)=>{
-        let aVal=a[sortColumn]; let bVal=b[sortColumn];
-        if (sortColumn!=='timestamp'){
-            if (typeof aVal==='string'){ aVal=aVal.toLowerCase(); }
-            if (typeof bVal==='string'){ bVal=bVal.toLowerCase(); }
-        }
-        if (aVal===bVal) return 0;
-        return sortDirection==='asc' ? (aVal>bVal?1:-1) : (aVal<bVal?1:-1);
-    });
-}
-
-// Live updates: attach and detach listeners based on current filters
-function detachLiveListeners(){
-    try {
-        liveListenerHandles.forEach(h=>{ try { h.ref.off('child_added', h.handler); } catch(e){} });
-    } finally {
-        liveListenerHandles = [];
-    }
-}
-
-function attachLiveListeners(devices, startMs, endMs){
-    // Determine latest timestamp per device from current cache to avoid duplicates
-    const latestByDevice = {};
-    for (const row of logDataCache){
-        const key = (row.device||'').toString().toLowerCase();
-        const ts = row.timestamp||0;
-        if (!latestByDevice[key] || ts>latestByDevice[key]) latestByDevice[key]=ts;
-    }
-    devices.forEach(dev=>{
-        const baseStart = Math.max(startMs, (latestByDevice[dev]||startMs)) + 1;
-        const ref = dbLog.ref(`kebun-${dev}/history`).orderByChild('timestamp').startAt(baseStart);
-        const handler = (snap)=>{
-            const data = snap.val(); if(!data) return;
-            // Compute timestamp robustly
-            let ts = null;
-            if (typeof data.timestamp === 'number') ts = data.timestamp;
-            else if (typeof data.timestamp === 'string' && !isNaN(+data.timestamp)) ts = +data.timestamp;
-            else if (typeof data.createdAt === 'number') ts = data.createdAt;
-            else if (data.date && data.time) { const dt = new Date(`${data.date} ${data.time}`); if (!isNaN(dt.getTime())) ts = dt.getTime(); }
-            if (ts === null) return;
-            if (ts < startMs || ts > endMs) return; // outside current filter range
-            const row = {
-                id: snap.key,
-                timestamp: ts,
-                device: dev.toUpperCase(),
-                ph: parseFloat(data.ph) || 0,
-                tds: parseInt(data.tds) || 0,
-                temperature: parseFloat(data.suhu ?? data.temperature) || 0,
-                cal_ph_asam: parseFloat(data.cal_ph_asam) || 0,
-                cal_ph_netral: parseFloat(data.cal_ph_netral) || 0,
-                cal_tds_k: parseFloat(data.cal_tds_k) || 0
-            };
-            logDataCache.push(row);
-            sortCache();
-            updateStatistics(logDataCache);
-            displayLogData(logDataCache);
-            updatePagination();
-        };
-        ref.on('child_added', handler);
-        liveListenerHandles.push({ref, handler});
-    });
-}
-
-function exportToCSV() {
-    if (!logDataCache.length) { alert('Tidak ada data untuk diekspor'); return; }
-    const headers = ['Waktu','Perangkat','pH','TDS (ppm)','Suhu (°C)','Cal pH Asam','Cal pH Netral','Cal TDS K'];
-    const csvData = logDataCache.map(r=>{
-        const date = new Date(r.timestamp); const formattedDate = date.toLocaleString('id-ID');
-        return [formattedDate, 'Perangkat '+r.device, r.ph.toFixed(1), Math.round(r.tds), r.temperature.toFixed(1), r.cal_ph_asam.toFixed(4), r.cal_ph_netral.toFixed(4), r.cal_tds_k.toFixed(4)];
-    });
-    const csvContent=[headers,...csvData].map(row=>row.map(c=>`"${c}"`).join(',')).join('\n');
-    const blob=new Blob([csvContent],{type:'text/csv;charset=utf-8;'}); const link=document.createElement('a'); const url=URL.createObjectURL(blob);
-    link.setAttribute('href',url); const now=new Date(); const filename=`hidroganik_data_${now.getFullYear()}-${(now.getMonth()+1+'').padStart(2,'0')}-${(now.getDate()+'').padStart(2,'0')}.csv`;
-    link.setAttribute('download',filename); link.style.visibility='hidden'; document.body.appendChild(link); link.click(); document.body.removeChild(link);
-    const exportBtn=document.getElementById('export-csv'); const original=exportBtn.innerHTML; exportBtn.innerHTML='✅ Exported!'; exportBtn.disabled=true; setTimeout(()=>{exportBtn.innerHTML=original; exportBtn.disabled=false;},2000);
-}
+let perPage = 25;
+let currentSort = 'desc'; // server-side sort by timestamp_ms
+let currentItems = [];
 
 document.addEventListener('DOMContentLoaded', ()=>{
-        const debouncedReload = debounce(()=>{ currentPage=1; loadLogData(); },600);
-        document.getElementById('start-date').addEventListener('input', debouncedReload);
-        document.getElementById('end-date').addEventListener('input', debouncedReload);
-        document.getElementById('device-filter').addEventListener('change', debouncedReload);
-    document.getElementById('export-csv').addEventListener('click', exportToCSV);
-    document.getElementById('prev-page').addEventListener('click', ()=>changePage(-1));
-    document.getElementById('next-page').addEventListener('click', ()=>changePage(1));
+    initLiveClock();
+    initLogo();
+    initFilters();
     loadLogData();
-        initLiveClock();
-        initLogo();
 });
 
-// Live clock for navbar
-function initLiveClock(){
-    function tick(){
-        const now=new Date();
-        const t=now.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-        const d=now.toLocaleDateString('id-ID',{weekday:'short',year:'numeric',month:'short',day:'numeric'});
-        const c=document.getElementById('real-time-clock'); if(c) c.textContent=t;
-        const cm=document.getElementById('real-time-clock-mobile'); if(cm) cm.textContent=t;
-        const de=document.getElementById('real-time-date'); if(de) de.textContent=d;
-        const dem=document.getElementById('real-time-date-mobile'); if(dem) dem.textContent=d;
-    }
-    tick(); setInterval(tick,1000);
+function initFilters(){
+    const startInput = document.getElementById('start-date');
+    const endInput = document.getElementById('end-date');
+    const deviceSel = document.getElementById('device-filter');
+    // default to last 7 days
+    const now = new Date();
+    const endStr = now.toISOString().slice(0,10);
+    const past = new Date(now.getTime() - 6*24*60*60*1000);
+    const startStr = past.toISOString().slice(0,10);
+    if (startInput && !startInput.value) startInput.value = startStr;
+    if (endInput && !endInput.value) endInput.value = endStr;
+    if (deviceSel && !deviceSel.value) deviceSel.value = 'all';
+
+    startInput?.addEventListener('change', onFilterChange);
+    endInput?.addEventListener('change', onFilterChange);
+    deviceSel?.addEventListener('change', onFilterChange);
+
+    document.getElementById('prev-page')?.addEventListener('click', ()=>{ if(currentPage>1){ currentPage--; loadLogData(); } });
+    document.getElementById('next-page')?.addEventListener('click', ()=>{ currentPage++; loadLogData(); });
+    document.getElementById('export-csv')?.addEventListener('click', exportCsv);
 }
 
-// Improved logo loader using same logic as calibration page
+function onFilterChange(){
+    currentPage = 1;
+    loadLogData();
+}
+
+async function loadLogData(){
+    const loading = document.getElementById('loading-indicator');
+    const noData = document.getElementById('no-data-message');
+    const table = document.getElementById('log-table');
+    loading?.classList.remove('hidden');
+    noData?.classList.add('hidden');
+    if (table) table.style.display = '';
+
+    const start = document.getElementById('start-date')?.value || '';
+    const end = document.getElementById('end-date')?.value || '';
+    const deviceVal = document.getElementById('device-filter')?.value || 'all';
+    const device = (deviceVal==='A' || deviceVal==='B') ? deviceVal : 'all';
+
+    const params = new URLSearchParams({
+        start, end,
+        device,
+        page: String(currentPage),
+        perPage: String(perPage),
+        sort: currentSort
+    });
+    try{
+        const res = await fetch(`/api/telemetry?${params.toString()}`, {headers:{'Accept':'application/json'}});
+        const data = await res.json();
+        currentItems = Array.isArray(data.items) ? data.items : [];
+        renderStats(data.stats || {});
+        renderTable(currentItems);
+        renderPagination(data.page||1, data.perPage||perPage, data.total||0);
+    }catch(err){
+        console.error('Gagal memuat data', err);
+        showNoData('Gagal memuat data dari server');
+    } finally {
+        loading?.classList.add('hidden');
+    }
+}
+
+function renderStats(stats){
+    document.getElementById('total-records').textContent = String(stats.total ?? '');
+    document.getElementById('avg-ph').textContent = (stats.avg_ph ?? 0).toFixed ? (stats.avg_ph).toFixed(2) : String(stats.avg_ph ?? '0.00');
+    document.getElementById('avg-tds').textContent = String(stats.avg_tds ?? '0');
+    document.getElementById('avg-temp').textContent = (stats.avg_suhu ?? 0).toFixed ? `${(stats.avg_suhu).toFixed(2)}°C` : `${stats.avg_suhu ?? '0.00'}°C`;
+}
+
+function renderTable(items){
+    const body = document.getElementById('log-table-body');
+    const countEl = document.getElementById('data-count');
+    if (!body) return;
+    body.innerHTML = '';
+    items.forEach(row=>{
+        const tr = document.createElement('tr');
+        tr.className = 'table-row';
+        const dt = row.timestamp_ms ? new Date(row.timestamp_ms) : null;
+        const timeStr = dt ? dt.toLocaleString('id-ID',{hour12:false}) : (row.created_at || '-');
+        tr.innerHTML = `
+            <td>${timeStr}</td>
+            <td>${row.device ?? '-'}</td>
+            <td>${fmtNum(row.ph, 2)}</td>
+            <td>${fmtNum(row.tds, 0)}</td>
+            <td>${fmtNum(row.suhu, 2)}</td>
+            <td>${fmtNum(row.cal_ph_asam, 4)}</td>
+            <td>${fmtNum(row.cal_ph_netral, 4)}</td>
+            <td>${fmtNum(row.cal_tds_k, 4)}</td>
+        `;
+        body.appendChild(tr);
+    });
+    countEl && (countEl.textContent = String(items.length));
+    if (items.length === 0) showNoData();
+}
+
+function renderPagination(page, perPageVal, total){
+    const pag = document.getElementById('pagination');
+    const fromEl = document.getElementById('showing-from');
+    const toEl = document.getElementById('showing-to');
+    const totalEl = document.getElementById('total-entries');
+    const prevBtn = document.getElementById('prev-page');
+    const nextBtn = document.getElementById('next-page');
+    // also update total in stats card
+    const totalRecords = document.getElementById('total-records');
+    if (totalRecords) totalRecords.textContent = String(total);
+
+    totalEl && (totalEl.textContent = String(total));
+    const from = total === 0 ? 0 : ((page-1)*perPageVal + 1);
+    const to = Math.min(page*perPageVal, total);
+    fromEl && (fromEl.textContent = String(from));
+    toEl && (toEl.textContent = String(to));
+    pag?.classList.toggle('hidden', total === 0);
+    prevBtn && (prevBtn.disabled = page <= 1);
+    const maxPage = Math.ceil(total / perPageVal);
+    nextBtn && (nextBtn.disabled = page >= maxPage);
+    currentPage = page; perPage = perPageVal;
+}
+
+function showNoData(msg){
+    const noData = document.getElementById('no-data-message');
+    noData?.classList.remove('hidden');
+    if (msg) {
+        const p = noData?.querySelector('p'); if (p) p.textContent = msg;
+    }
+}
+
+// Sort current page locally by given field (client-side only)
+function sortTable(field){
+    if (!Array.isArray(currentItems) || currentItems.length === 0) return;
+    const dir = (sortTable.lastKey === field && sortTable.lastDir === 'asc') ? 'desc' : 'asc';
+    sortTable.lastKey = field; sortTable.lastDir = dir;
+    const sign = dir === 'asc' ? 1 : -1;
+    currentItems.sort((a,b)=>{
+        const va = (a[field] ?? 0); const vb = (b[field] ?? 0);
+        if (va < vb) return -1*sign; if (va > vb) return 1*sign; return 0;
+    });
+    renderTable(currentItems);
+}
+
+async function exportCsv(){
+    const start = document.getElementById('start-date')?.value || '';
+    const end = document.getElementById('end-date')?.value || '';
+    const deviceVal = document.getElementById('device-filter')?.value || 'all';
+    const device = (deviceVal==='A' || deviceVal==='B') ? deviceVal : 'all';
+    const params = new URLSearchParams({ start, end, device, page: '1', perPage: '1000', sort: 'desc' });
+    try{
+        const res = await fetch(`/api/telemetry?${params.toString()}`, {headers:{'Accept':'application/json'}});
+        const data = await res.json();
+        const rows = Array.isArray(data.items) ? data.items : [];
+        const csv = toCsv(rows);
+        const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `telemetry_${start||'all'}_${end||'all'}_${device}.csv`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+    }catch(e){ console.error('Export CSV gagal', e); }
+}
+
+function toCsv(rows){
+    const headers = ['timestamp','device','ph','tds','suhu','cal_ph_asam','cal_ph_netral','cal_tds_k','kebun','created_at'];
+    const lines = [headers.join(',')];
+    rows.forEach(r=>{
+        const dt = r.timestamp_ms ? new Date(r.timestamp_ms).toISOString() : '';
+        const line = [
+            dt,
+            r.device ?? '',
+            safeCsv(r.ph),
+            safeCsv(r.tds),
+            safeCsv(r.suhu),
+            safeCsv(r.cal_ph_asam),
+            safeCsv(r.cal_ph_netral),
+            safeCsv(r.cal_tds_k),
+            r.kebun ?? '',
+            r.created_at ?? ''
+        ].join(',');
+        lines.push(line);
+    });
+    return lines.join('\n');
+}
+
+function safeCsv(v){
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')){
+        return '"' + s.replace(/"/g,'""') + '"';
+    }
+    return s;
+}
+
+function fmtNum(v, digits){
+    if (v === null || v === undefined || isNaN(v)) return '-';
+    if (typeof v === 'number' && Number.isFinite(v)) return v.toFixed(digits);
+    const n = Number(v); return Number.isFinite(n) ? n.toFixed(digits) : '-';
+}
+
+function initLiveClock(){
+  function tick(){
+    const now=new Date();
+    const t=now.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const d=now.toLocaleDateString('id-ID',{weekday:'short',year:'numeric',month:'short',day:'numeric'});
+    const c=document.getElementById('real-time-clock'); if(c) c.textContent=t;
+    const cm=document.getElementById('real-time-clock-mobile'); if(cm) cm.textContent=t;
+    const de=document.getElementById('real-time-date'); if(de) de.textContent=d;
+    const dem=document.getElementById('real-time-date-mobile'); if(dem) dem.textContent=d;
+  }
+  tick(); setInterval(tick,1000);
+}
 function initLogo(){
-    const logoImg=document.getElementById('company-logo');
-    if(!logoImg) return; const fallback=document.getElementById('logo-fallback');
-    const base = (typeof APP_BASE_URL!=='undefined') ? APP_BASE_URL : '';
-    const sources=[
-        base + '/assets/logo.png',
-        base + '/assets/logo.jpg',
-        base + '/assets/logo.svg',
-        base + '/logo.png',
-        base + '/logo.jpg'
-    ];
-    let loaded=false;
-    sources.forEach(src=>{
-        if(loaded) return; const test=new Image(); test.onload=()=>{ if(!loaded){ logoImg.src=src; logoImg.classList.remove('hidden'); if(fallback) fallback.style.display='none'; loaded=true; } }; test.src=src; });
-    // If still not loaded after 3s keep fallback icon
-    setTimeout(()=>{ if(!loaded && fallback){ fallback.style.display='flex'; } },3000);
+  const logoImg=document.getElementById('company-logo');
+  if(!logoImg) return; const fallback=document.getElementById('logo-fallback');
+  const base = (typeof APP_BASE_URL!=='undefined') ? APP_BASE_URL : '';
+  const sources=[base + '/assets/logo.png',base + '/assets/logo.jpg',base + '/assets/logo.svg',base + '/logo.png',base + '/logo.jpg'];
+  let loaded=false;
+  sources.forEach(src=>{ if(loaded) return; const test=new Image(); test.onload=()=>{ if(!loaded){ logoImg.src=src; logoImg.classList.remove('hidden'); if(fallback) fallback.style.display='none'; loaded=true; } }; test.src=src; });
+  setTimeout(()=>{ if(!loaded && fallback){ fallback.style.display='flex'; } },3000);
 }
 </script>
 <?= $this->endSection() ?>

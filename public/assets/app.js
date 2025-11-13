@@ -12,24 +12,53 @@
  * - Data realtime sensor juga ter-log
  */
 
-// Konfigurasi Firebase
-const firebaseConfig = {
-  apiKey: "AIzaSyCFx2ZlJRGZfD-P6I84a53yc8D_cyFqvgs",
-  authDomain: "hidroganik-monitoring.firebaseapp.com",
-  databaseURL:
-    "https://hidroganik-monitoring-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "hidroganik-monitoring",
-  storageBucket: "hidroganik-monitoring.firebasestorage.app",
-  messagingSenderId: "103705402081",
-  appId: "1:103705402081:web:babc15ad263749e80535a0",
-};
-
-firebase.initializeApp(firebaseConfig);
-const database = firebase.database();
+// Firebase Realtime Database is disabled for data; Firebase is used for Auth only.
+// Provide a minimal in-memory stub so existing code paths don't break.
+const USE_FIREBASE_DB = false;
+function createFakeRef() {
+  const state = { _value: null, _handlers: {} };
+  return {
+    on(event, handler) {
+      // store handler, no automatic firing
+      state._handlers[event] = state._handlers[event] || [];
+      state._handlers[event].push(handler);
+    },
+    off(event, handler) {
+      if (!event) {
+        state._handlers = {};
+        return;
+      }
+      const arr = state._handlers[event] || [];
+      if (!handler) {
+        state._handlers[event] = [];
+        return;
+      }
+      state._handlers[event] = arr.filter((h) => h !== handler);
+    },
+    once(event) {
+      return Promise.resolve({ val: () => state._value });
+    },
+    set(val) {
+      state._value = val;
+      return Promise.resolve();
+    },
+    update(obj) {
+      if (typeof state._value !== "object" || state._value === null)
+        state._value = {};
+      Object.assign(state._value, obj || {});
+      return Promise.resolve();
+    },
+    push(val) {
+      // emulate push key
+      return Promise.resolve({ key: Math.random().toString(36).slice(2) });
+    },
+  };
+}
+const database = { ref: (_path) => createFakeRef() };
 
 // MQTT configuration (WebSocket broker)
-// Adjust to your MQTT broker that supports WebSocket (ws/wss)
-const MQTT_WS_URL = "wss://broker.hivemq.com:8884/mqtt";
+// Using broker.emqx.io with WebSocket Secure port 8084
+const MQTT_WS_URL = "wss://broker.emqx.io:8084/mqtt";
 const MQTT_OPTIONS = {
   clean: true,
   connectTimeout: 4000,
@@ -46,6 +75,9 @@ const TOPIC_CMD_A = "hidroganik/kebun-a/cmd";
 const TOPIC_CMD_B = "hidroganik/kebun-b/cmd";
 
 let mqttClient = null;
+// Track pump status locally now that Firebase DB is disabled
+let pumpStatusA = "OFF";
+let pumpStatusB = "OFF";
 
 function initMqtt() {
   if (!window.mqtt) {
@@ -83,50 +115,86 @@ function initMqtt() {
       console.warn("Non-JSON telemetry received, ignoring", topic, msg);
       return;
     }
-    const now = new Date().toISOString();
+    const now = new Date();
+    const currentTime = now.toLocaleTimeString("id-ID", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    const dateString = now.toLocaleDateString("id-ID", {
+      weekday: "short",
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+    });
     const norm = normalizeTelemetry(data);
     if (topic === TOPIC_TLM_A) {
-      realtimeRef.update(norm).catch(console.error);
-      database
-        .ref("kebun-a/history")
-        .push({
-          ...norm,
-          timestamp: computeTimestamp(norm),
-          _ts: firebase.database.ServerValue.TIMESTAMP,
-        })
-        .catch(console.error);
-      console.log("📥 MQTT → Firebase (A)", norm, now);
+      // Update last update timestamp for Kebun A
+      const lastUpdateA = document.getElementById("last-update-a");
+      if (lastUpdateA) {
+        lastUpdateA.textContent = `Last update: ${currentTime}`;
+        lastUpdateA.title = `Update: ${dateString}`;
+      }
+      // Update UI directly from MQTT
+      updateDisplayValues(norm, "A");
+      updateCharts(norm, 1);
+      if (norm.cal_ph_asam || norm.cal_ph_netral || norm.cal_tds_k) {
+        try {
+          updateCalibrationDisplay(norm, "A");
+        } catch {}
+      }
+      console.log("📥 MQTT → UI (A)", norm, now.toISOString());
+      // Auto mode check
+      if (pumpModeA === "auto") {
+        checkAutoConditions(norm, "A");
+      }
     } else if (topic === TOPIC_TLM_B) {
-      realtimeRefB.update(norm).catch(console.error);
-      database
-        .ref("kebun-b/history")
-        .push({
-          ...norm,
-          timestamp: computeTimestamp(norm),
-          _ts: firebase.database.ServerValue.TIMESTAMP,
-        })
-        .catch(console.error);
-      console.log("📥 MQTT → Firebase (B)", norm, now);
+      // Update last update timestamp for Kebun B
+      const lastUpdateB = document.getElementById("last-update-b");
+      if (lastUpdateB) {
+        lastUpdateB.textContent = `Last update: ${currentTime}`;
+        lastUpdateB.title = `Update: ${dateString}`;
+      }
+      updateDisplayValues(norm, "B");
+      updateCharts(norm, 2);
+      if (norm.cal_ph_asam || norm.cal_ph_netral || norm.cal_tds_k) {
+        try {
+          updateCalibrationDisplay(norm, "B");
+        } catch {}
+      }
+      console.log("📥 MQTT → UI (B)", norm, now.toISOString());
+      // Auto mode check
+      if (pumpModeB === "auto") {
+        checkAutoConditions(norm, "B");
+      }
     } else {
       // Wildcard route: hidroganik/{kebun-id}/telemetry
       const m = topic.match(/^hidroganik\/(kebun-[^/]+)\/telemetry$/i);
       if (m && m[1]) {
         const kebunId = m[1].toLowerCase();
-        const realtimePath = `${kebunId}/realtime`;
-        const historyPath = `${kebunId}/history`;
-        database
-          .ref(realtimePath)
-          .update(norm)
-          .catch((e) => console.error(`FB realtime ${kebunId} err:`, e));
-        database
-          .ref(historyPath)
-          .push({
-            ...norm,
-            timestamp: computeTimestamp(norm),
-            _ts: firebase.database.ServerValue.TIMESTAMP,
-          })
-          .then(() => console.log(`📥 MQTT → Firebase (${kebunId})`, norm, now))
-          .catch((e) => console.error(`FB history ${kebunId} err:`, e));
+        // Update UI based on kebun id
+        const unit = kebunId.endsWith("b") ? "B" : "A";
+        // Update last update timestamp
+        const lastUpdateEl = document.getElementById(
+          `last-update-${unit.toLowerCase()}`
+        );
+        if (lastUpdateEl) {
+          lastUpdateEl.textContent = `Last update: ${currentTime}`;
+          lastUpdateEl.title = `Update: ${dateString}`;
+        }
+        updateDisplayValues(norm, unit);
+        updateCharts(norm, unit === "A" ? 1 : 2);
+        if (norm.cal_ph_asam || norm.cal_ph_netral || norm.cal_tds_k) {
+          try {
+            updateCalibrationDisplay(norm, unit);
+          } catch {}
+        }
+        console.log(`📥 MQTT → UI (${kebunId})`, norm, now.toISOString());
+        // Auto mode check
+        const currentMode = unit === "A" ? pumpModeA : pumpModeB;
+        if (currentMode === "auto") {
+          checkAutoConditions(norm, unit);
+        }
       } else {
         console.warn("MQTT topic tidak dikenali untuk routing:", topic);
       }
@@ -518,48 +586,42 @@ function saveSchedule(kebun) {
   console.log(`  ├─ Waktu mulai: ${startTime}`);
   console.log(`  ├─ Waktu selesai: ${endTime}`);
   console.log(`  ├─ Mode: Pompa nyala terus-menerus dalam rentang waktu`);
-  console.log(`  ├─ Firebase path: kebun-${kebun.toLowerCase()}/jadwal`);
+  console.log(`  ├─ Channel: MQTT-only (no Firebase DB)`);
   console.log(`  └─ Data object:`, scheduleData);
 
-  // Save to Firebase
-  const jadwalRef = kebun === "A" ? jadwalRefA : jadwalRefB;
-  console.log(`[${currentTime}] 🚀 Mengirim jadwal ke Firebase...`);
+  // Apply locally and publish via MQTT
+  try {
+    if (kebun === "A") currentScheduleA = scheduleData;
+    else currentScheduleB = scheduleData;
+    const successTime = new Date().toLocaleTimeString("id-ID");
+    console.log(`[${successTime}] ✅ Jadwal tersimpan (local):`);
+    console.log(`  ├─ Kebun: ${kebun}`);
+    console.log(
+      `  ├─ Waktu operasi: ${startTime} - ${endTime} (terus-menerus)`
+    );
+    console.log(`  ├─ Mode: Pompa akan menyala selama rentang waktu`);
+    console.log(`  └─ Action: Setup timer otomatis`);
 
-  jadwalRef
-    .set(scheduleData)
-    .then(() => {
-      const successTime = new Date().toLocaleTimeString("id-ID");
-      console.log(`[${successTime}] ✅ Jadwal berhasil disimpan ke Firebase:`);
-      console.log(`  ├─ Kebun: ${kebun}`);
-      console.log(
-        `  ├─ Waktu operasi: ${startTime} - ${endTime} (terus-menerus)`
-      );
-      console.log(`  ├─ Mode: Pompa akan menyala selama rentang waktu`);
-      console.log(`  ├─ Firebase response: Success`);
-      console.log(`  └─ Action: Setup timer otomatis`);
-
-      alert(`Jadwal Kebun ${kebun} berhasil disimpan!`);
-      setupScheduleTimer(kebun);
-      // Also publish to MQTT so device updates schedule immediately
-      const cmdTopic = kebun === "A" ? TOPIC_CMD_A : TOPIC_CMD_B;
-      const ok = mqttPublish(cmdTopic, {
-        type: "schedule",
-        data: scheduleData,
-      });
-      if (ok) {
-        console.log(`📤 MQTT schedule published (${kebun})`, scheduleData);
-      }
-    })
-    .catch((error) => {
-      const errorTime = new Date().toLocaleTimeString("id-ID");
-      console.log(`[${errorTime}] ❌ Gagal menyimpan jadwal ke Firebase:`);
-      console.error(`  ├─ Kebun: ${kebun}`);
-      console.error(`  ├─ Error: ${error.message}`);
-      console.error(`  ├─ Firebase path: kebun-${kebun.toLowerCase()}/jadwal`);
-      console.error(`  └─ Data yang gagal dikirim:`, scheduleData);
-
-      alert(`Error menyimpan jadwal: ${error.message}`);
+    alert(`Jadwal Kebun ${kebun} berhasil disimpan!`);
+    setupScheduleTimer(kebun);
+    // Also publish to MQTT so device updates schedule immediately
+    const cmdTopic = kebun === "A" ? TOPIC_CMD_A : TOPIC_CMD_B;
+    const ok = mqttPublish(cmdTopic, {
+      type: "schedule",
+      data: scheduleData,
     });
+    if (ok) {
+      console.log(`📤 MQTT schedule published (${kebun})`, scheduleData);
+    }
+  } catch (error) {
+    const errorTime = new Date().toLocaleTimeString("id-ID");
+    console.log(`[${errorTime}] ❌ Gagal menyimpan jadwal:`);
+    console.error(`  ├─ Kebun: ${kebun}`);
+    console.error(`  ├─ Error: ${error.message}`);
+    console.error(`  └─ Data yang gagal dikirim:`, scheduleData);
+
+    alert(`Error menyimpan jadwal: ${error.message}`);
+  }
 }
 
 function saveAutoSettings(kebun) {
@@ -967,202 +1029,32 @@ function initFirebaseListeners() {
   console.log(
     `[${new Date().toLocaleTimeString(
       "id-ID"
-    )}] 🔗 Menginisialisasi Firebase listeners...`
+    )}] 🔗 Firebase DB listeners DISABLED (using MQTT only for realtime data)...`
   );
 
-  // Real-time data listener for Device A
-  realtimeRef.on("value", (snapshot) => {
-    const data = snapshot.val();
-    if (!data) return;
+  // Firebase DB disabled for realtime data; all data comes from MQTT now.
+  // Pump status, schedule, and auto-mode settings remain local or via MQTT commands.
+  // Last update timestamps will be set by MQTT message handlers.
 
-    const now = new Date();
-    const currentTime = now.toLocaleTimeString("id-ID", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-    const dateString = now.toLocaleDateString("id-ID", {
-      weekday: "short",
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-    console.log(`[${currentTime}] 📊 Data Realtime Kebun A diterima:`);
-    console.log(`  ├─ pH: ${data.ph}`);
-    console.log(`  ├─ TDS: ${data.tds} ppm`);
-    console.log(`  ├─ Suhu: ${data.suhu} °C`);
-    console.log(`  ├─ Firebase path: kebun-a/realtime`);
-    console.log(`  └─ Timestamp: ${now.toISOString()}`);
-
-    // Update last update indicator
-    const lastUpdateA = document.getElementById("last-update-a");
-    if (lastUpdateA) {
-      lastUpdateA.textContent = `Last update: ${currentTime}`;
-      lastUpdateA.title = `Update: ${dateString}`;
-    }
-    updateDisplayValues(data, "A");
-    updateCharts(data, 1);
-
-    // Auto mode logic (using Device A data)
-    if (pumpModeA === "auto") {
-      console.log(
-        `[${currentTime}] 🤖 Menjalankan pengecekan otomatis Kebun A...`
-      );
-      checkAutoConditions(data, "A");
-    }
-  });
-
-  // Real-time data listener for Device B
-  realtimeRefB.on("value", (snapshot) => {
-    const data = snapshot.val();
-    if (!data) return;
-
-    const now = new Date();
-    const currentTime = now.toLocaleTimeString("id-ID", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-    const dateString = now.toLocaleDateString("id-ID", {
-      weekday: "short",
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-    console.log(`[${currentTime}] 📊 Data Realtime Kebun B diterima:`);
-    console.log(`  ├─ pH: ${data.ph}`);
-    console.log(`  ├─ TDS: ${data.tds} ppm`);
-    console.log(`  ├─ Suhu: ${data.suhu} °C`);
-    console.log(`  ├─ Firebase path: kebun-b/realtime`);
-    console.log(`  └─ Timestamp: ${now.toISOString()}`);
-
-    // Update last update indicator for Kebun B
-    const lastUpdateB = document.getElementById("last-update-b");
-    if (lastUpdateB) {
-      lastUpdateB.textContent = `Last update: ${currentTime}`;
-      lastUpdateB.title = `Update: ${dateString}`;
-    }
-    updateDisplayValues(data, "B");
-    updateCharts(data, 2);
-
-    // Auto mode logic (using Device B data)
-    if (pumpModeB === "auto") {
-      console.log(
-        `[${currentTime}] 🤖 Menjalankan pengecekan otomatis Kebun B...`
-      );
-      checkAutoConditions(data, "B");
-    }
-  });
-
-  // Pump status listener for Kebun A
-  pompaRefA.on("value", (snapshot) => {
-    const status = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-    console.log(`[${currentTime}] 💧 Status Pompa Kebun A berubah:`);
-    console.log(`  ├─ Status baru: ${status}`);
-    console.log(`  ├─ Firebase path: kebun-a/status/pompa`);
-    console.log(`  └─ Action: Update UI display`);
-
-    updatePumpDisplayA(status);
-  });
-
-  // Pump status listener for Kebun B
-  pompaRefB.on("value", (snapshot) => {
-    const status = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-    console.log(`[${currentTime}] 💧 Status Pompa Kebun B berubah:`);
-    console.log(`  ├─ Status baru: ${status}`);
-    console.log(`  ├─ Firebase path: kebun-b/status/pompa`);
-    console.log(`  └─ Action: Update UI display`);
-
-    updatePumpDisplayB(status);
-  });
-
-  // Schedule listener for Kebun A
-  jadwalRefA.on("value", (snapshot) => {
-    currentScheduleA = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-    console.log(`[${currentTime}] 📅 Jadwal Kebun A berubah:`);
-    console.log(`  ├─ Data jadwal:`, currentScheduleA);
-    console.log(`  ├─ Firebase path: kebun-a/jadwal`);
-    console.log(`  └─ Mode: ${pumpModeA}`);
-
-    if (pumpModeA === "scheduled" && currentScheduleA) {
-      console.log(`[${currentTime}] ⏰ Setup timer untuk Kebun A...`);
-      setupScheduleTimer("A");
-    }
-  });
-
-  // Schedule listener for Kebun B
-  jadwalRefB.on("value", (snapshot) => {
-    currentScheduleB = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-    console.log(`[${currentTime}] 📅 Jadwal Kebun B berubah:`);
-    console.log(`  ├─ Data jadwal:`, currentScheduleB);
-    console.log(`  ├─ Firebase path: kebun-b/jadwal`);
-    console.log(`  └─ Mode: ${pumpModeB}`);
-
-    if (pumpModeB === "scheduled" && currentScheduleB) {
-      console.log(`[${currentTime}] ⏰ Setup timer untuk Kebun B...`);
-      setupScheduleTimer("B");
-    }
-  });
+  // Pump, schedule, and calibration listeners disabled.
+  // Pump status tracked locally (pumpStatusA/B).
+  // Schedules managed via local currentScheduleA/B + MQTT publish.
+  // Calibration data comes from MQTT telemetry payloads.
 
   console.log(
     `[${new Date().toLocaleTimeString(
       "id-ID"
-    )}] ✅ Semua Firebase listeners berhasil diinisialisasi`
+    )}] ✅ Firebase DB listeners skipped (MQTT-only mode active)`
   );
 }
 
-// Initialize Calibration Data Listeners
 function initCalibrationListeners() {
-  // Calibration listener for Kebun A
-  kalibrasiaRefA.on("value", (snapshot) => {
-    const calibrationData = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-
-    if (calibrationData) {
-      console.log(`[${currentTime}] 🔧 Data Kalibrasi Kebun A diterima:`);
-      console.log(`  ├─ cal_ph_asam: ${calibrationData.cal_ph_asam || "--"}`);
-      console.log(
-        `  ├─ cal_ph_netral: ${calibrationData.cal_ph_netral || "--"}`
-      );
-      console.log(`  ├─ cal_tds_k: ${calibrationData.cal_tds_k || "--"}`);
-      console.log(`  └─ Firebase path: kebun-a/kalibrasi`);
-
-      updateCalibrationDisplay(calibrationData, "A");
-    } else {
-      console.log(`[${currentTime}] ⚠️ Data kalibrasi Kebun A tidak ditemukan`);
-      updateCalibrationDisplay({}, "A");
-    }
-  });
-
-  // Calibration listener for Kebun B
-  kalibrasiaRefB.on("value", (snapshot) => {
-    const calibrationData = snapshot.val();
-    const currentTime = new Date().toLocaleTimeString("id-ID");
-
-    if (calibrationData) {
-      console.log(`[${currentTime}] 🔧 Data Kalibrasi Kebun B diterima:`);
-      console.log(`  ├─ cal_ph_asam: ${calibrationData.cal_ph_asam || "--"}`);
-      console.log(
-        `  ├─ cal_ph_netral: ${calibrationData.cal_ph_netral || "--"}`
-      );
-      console.log(`  ├─ cal_tds_k: ${calibrationData.cal_tds_k || "--"}`);
-      console.log(`  └─ Firebase path: kebun-b/kalibrasi`);
-
-      updateCalibrationDisplay(calibrationData, "B");
-    } else {
-      console.log(`[${currentTime}] ⚠️ Data kalibrasi Kebun B tidak ditemukan`);
-      updateCalibrationDisplay({}, "B");
-    }
-  });
-
+  // Calibration data now comes directly from MQTT telemetry messages.
+  // The MQTT message handler (on 'message' callback) calls updateCalibrationDisplay when cal_* fields present.
   console.log(
     `[${new Date().toLocaleTimeString(
       "id-ID"
-    )}] ✅ Calibration listeners berhasil diinisialisasi`
+    )}] ✅ Calibration data sourced from MQTT telemetry (no Firebase listeners)`
   );
 }
 
@@ -1276,8 +1168,8 @@ function setText(id, value, decimals) {
 
 function togglePump(kebun = "A") {
   const currentMode = kebun === "A" ? pumpModeA : pumpModeB;
-  const pompaRef = kebun === "A" ? pompaRefA : pompaRefB;
   const cmdTopic = kebun === "A" ? TOPIC_CMD_A : TOPIC_CMD_B;
+  const currentStatus = kebun === "A" ? pumpStatusA : pumpStatusB;
 
   if (currentMode !== "manual") {
     alert(
@@ -1286,21 +1178,18 @@ function togglePump(kebun = "A") {
     return;
   }
 
-  pompaRef.once("value").then((snapshot) => {
-    const currentStatus = snapshot.val();
-    const newStatus = currentStatus === "ON" ? "OFF" : "ON";
-    // Publish MQTT command
-    const mqttOk = mqttPublish(cmdTopic, { type: "pump", action: newStatus });
-    if (mqttOk) {
-      console.log(`📤 MQTT command sent (${kebun}):`, newStatus);
-    }
-    pompaRef
-      .set(newStatus)
-      .then(() => console.log(`Pompa Kebun ${kebun} diubah ke:`, newStatus))
-      .catch((error) =>
-        console.error(`Gagal mengirim perintah Kebun ${kebun}:`, error)
-      );
-  });
+  const newStatus = currentStatus === "ON" ? "OFF" : "ON";
+  const mqttOk = mqttPublish(cmdTopic, { type: "pump", action: newStatus });
+  if (mqttOk) {
+    console.log(`📤 MQTT command sent (${kebun}):`, newStatus);
+  }
+  if (kebun === "A") {
+    pumpStatusA = newStatus;
+    updatePumpDisplayA(newStatus);
+  } else {
+    pumpStatusB = newStatus;
+    updatePumpDisplayB(newStatus);
+  }
 }
 
 // Make function available globally for onclick handlers
@@ -1309,7 +1198,6 @@ window.togglePump = togglePump;
 // Manual toggle function for toggle switches
 function manualToggle(kebun) {
   const currentMode = kebun === "A" ? pumpModeA : pumpModeB;
-  const pompaRef = kebun === "A" ? pompaRefA : pompaRefB;
   const cmdTopic = kebun === "A" ? TOPIC_CMD_A : TOPIC_CMD_B;
 
   // Get the toggle element that was clicked
@@ -1328,7 +1216,7 @@ function manualToggle(kebun) {
   console.log(`[${currentTime}] 🔄 Manual Toggle Kebun ${kebun}:`);
   console.log(`  ├─ Mode saat ini: ${currentMode}`);
   console.log(`  ├─ Toggle state: ${isChecked ? "ON" : "OFF"}`);
-  console.log(`  └─ Firebase path: kebun-${kebun.toLowerCase()}/status/pompa`);
+  console.log(`  └─ Command path: MQTT cmd topic`);
 
   if (currentMode !== "manual") {
     console.log(
@@ -1338,24 +1226,22 @@ function manualToggle(kebun) {
       `Pompa Kebun ${kebun} dalam mode otomatis. Ubah ke mode manual untuk kontrol manual.`
     );
     // Reset toggle to current state
-    pompaRef.once("value").then((snapshot) => {
-      const currentStatus = snapshot.val();
-      const shouldBeChecked = currentStatus === "ON";
-      console.log(
-        `[${currentTime}] 🔄 Reset toggle ke status aktual: ${currentStatus}`
-      );
-      if (manualToggleEl) manualToggleEl.checked = shouldBeChecked;
-    });
+    const statusNow = kebun === "A" ? pumpStatusA : pumpStatusB;
+    const shouldBeChecked = statusNow === "ON";
+    console.log(
+      `[${currentTime}] 🔄 Reset toggle ke status aktual: ${statusNow}`
+    );
+    if (manualToggleEl) manualToggleEl.checked = shouldBeChecked;
     return;
   }
 
   const newStatus = isChecked ? "ON" : "OFF";
 
   // Log data yang akan dikirim ke Firebase
-  console.log(`[${currentTime}] 🚀 Mengirim data ke Firebase:`);
+  console.log(`[${currentTime}] 🚀 Mengirim perintah pompa:`);
   console.log(`  ├─ Kebun: ${kebun}`);
   console.log(`  ├─ Status baru: ${newStatus}`);
-  console.log(`  ├─ Firebase ref: kebun-${kebun.toLowerCase()}/status/pompa`);
+  console.log(`  ├─ Channel: MQTT`);
   console.log(`  └─ User action: Manual toggle switch`);
 
   // Publish MQTT command
@@ -1364,23 +1250,15 @@ function manualToggle(kebun) {
     console.log(`📤 MQTT command sent (${kebun}):`, newStatus);
   }
 
-  pompaRef
-    .set(newStatus)
-    .then(() => {
-      console.log(`[${currentTime}] ✅ Berhasil mengirim ke Firebase:`);
-      console.log(`  ├─ Pompa Kebun ${kebun}: ${newStatus}`);
-      console.log(`  ├─ Timestamp: ${new Date().toISOString()}`);
-      console.log(`  └─ Firebase response: Success`);
-      updateKebunStatus(kebun);
-    })
-    .catch((error) => {
-      console.log(`[${currentTime}] ❌ Gagal mengirim ke Firebase:`);
-      console.error(`  ├─ Kebun: ${kebun}`);
-      console.error(`  ├─ Error: ${error.message}`);
-      console.error(`  └─ Action: Reset toggle state`);
-      // Reset toggle on error
-      if (manualToggleEl) manualToggleEl.checked = !isChecked;
-    });
+  // Update local state/UI immediately
+  if (kebun === "A") {
+    pumpStatusA = newStatus;
+    updatePumpDisplayA(newStatus);
+  } else {
+    pumpStatusB = newStatus;
+    updatePumpDisplayB(newStatus);
+  }
+  updateKebunStatus(kebun);
 }
 
 // Make manual toggle available globally
@@ -1452,7 +1330,7 @@ function setupScheduleTimer(kebun = "A") {
   const scheduleTimer = isKebunA ? scheduleTimerA : scheduleTimerB;
   const currentSchedule = isKebunA ? currentScheduleA : currentScheduleB;
   const pumpMode = isKebunA ? pumpModeA : pumpModeB;
-  const pompaRef = isKebunA ? pompaRefA : pompaRefB;
+  // Firebase disabled: use local state instead of DB reference
 
   const currentTime = new Date().toLocaleTimeString("id-ID");
   console.log(`[${currentTime}] ⏰ Setup Schedule Timer Kebun ${kebun}:`);
@@ -1533,120 +1411,77 @@ function setupScheduleTimer(kebun = "A") {
       }
     }
 
-    // Get current pump status
-    pompaRef
-      .once("value")
-      .then((snapshot) => {
-        const currentStatus = snapshot.val();
+    // Get current pump status from local state
+    const currentStatus = isKebunA ? pumpStatusA : pumpStatusB;
 
-        if (isWithinSchedule && currentStatus !== "ON") {
-          // Should be ON but currently OFF - turn it ON
-          const triggerTime = new Date().toLocaleTimeString("id-ID");
-          console.log(`[${triggerTime}] � JADWAL START - Kebun ${kebun}:`);
-          console.log(`  ├─ Waktu sekarang: ${currentTime}`);
-          console.log(`  ├─ Dalam rentang: ${startTime} - ${endTime}`);
-          console.log(`  ├─ Status saat ini: ${currentStatus}`);
-          console.log(`  ├─ Action: Menyalakan pompa untuk jadwal`);
-          console.log(
-            `  ├─ Firebase path: kebun-${kebun.toLowerCase()}/status/pompa`
-          );
-          console.log(`  └─ Mengirim command: ON`);
+    if (isWithinSchedule && currentStatus !== "ON") {
+      // Should be ON but currently OFF - turn it ON
+      const triggerTime = new Date().toLocaleTimeString("id-ID");
+      console.log(`[${triggerTime}] � JADWAL START - Kebun ${kebun}:`);
+      console.log(`  ├─ Waktu sekarang: ${currentTime}`);
+      console.log(`  ├─ Dalam rentang: ${startTime} - ${endTime}`);
+      console.log(`  ├─ Status saat ini: ${currentStatus}`);
+      console.log(`  ├─ Action: Menyalakan pompa untuk jadwal`);
+      console.log(`  ├─ Channel: MQTT`);
+      console.log(`  └─ Mengirim command: ON`);
 
-          // Publish MQTT command to turn pump ON for this kebun
-          try {
-            const cmdTopic = isKebunA ? TOPIC_CMD_A : TOPIC_CMD_B;
-            const ok = mqttPublish(cmdTopic, { type: "pump", action: "ON" });
-            if (ok)
-              console.log(`📤 MQTT command sent (${kebun}): ON [scheduled]`);
-          } catch (e) {
-            console.warn("MQTT publish (scheduled ON) failed:", e);
-          }
+      // Publish MQTT command to turn pump ON for this kebun
+      try {
+        const cmdTopic = isKebunA ? TOPIC_CMD_A : TOPIC_CMD_B;
+        const ok = mqttPublish(cmdTopic, { type: "pump", action: "ON" });
+        if (ok) console.log(`📤 MQTT command sent (${kebun}): ON [scheduled]`);
+      } catch (e) {
+        console.warn("MQTT publish (scheduled ON) failed:", e);
+      }
 
-          pompaRef
-            .set("ON")
-            .then(() => {
-              console.log(
-                `[${triggerTime}] ✅ JADWAL START SUCCESS - Kebun ${kebun}:`
-              );
-              console.log(`  ├─ Pompa berhasil dinyalakan`);
-              console.log(`  ├─ Firebase response: Success`);
-              console.log(
-                `  └─ Pompa akan menyala sampai ${endTime} (eksklusif)`
-              );
-            })
-            .catch((error) => {
-              console.log(
-                `[${triggerTime}] ❌ JADWAL START ERROR - Kebun ${kebun}:`
-              );
-              console.error(`  ├─ Error: ${error.message}`);
-              console.error(`  └─ Gagal menyalakan pompa`);
-            });
-        } else if (!isWithinSchedule && currentStatus === "ON") {
-          // Should be OFF but currently ON - turn it OFF
-          const stopTime = new Date().toLocaleTimeString("id-ID");
-          console.log(`[${stopTime}] 🔴 JADWAL END - Kebun ${kebun}:`);
-          console.log(`  ├─ Waktu sekarang: ${currentTime}`);
-          console.log(`  ├─ Di luar rentang: ${startTime} - ${endTime}`);
-          console.log(`  ├─ Status saat ini: ${currentStatus}`);
-          console.log(`  ├─ Action: Mematikan pompa (jadwal selesai)`);
-          console.log(
-            `  ├─ Firebase path: kebun-${kebun.toLowerCase()}/status/pompa`
-          );
-          console.log(`  └─ Mengirim command: OFF`);
+      // Update local status/UI
+      if (isKebunA) {
+        pumpStatusA = "ON";
+        updatePumpDisplayA("ON");
+      } else {
+        pumpStatusB = "ON";
+        updatePumpDisplayB("ON");
+      }
+    } else if (!isWithinSchedule && currentStatus === "ON") {
+      // Should be OFF but currently ON - turn it OFF
+      const stopTime = new Date().toLocaleTimeString("id-ID");
+      console.log(`[${stopTime}] 🔴 JADWAL END - Kebun ${kebun}:`);
+      console.log(`  ├─ Waktu sekarang: ${currentTime}`);
+      console.log(`  ├─ Di luar rentang: ${startTime} - ${endTime}`);
+      console.log(`  ├─ Status saat ini: ${currentStatus}`);
+      console.log(`  ├─ Action: Mematikan pompa (jadwal selesai)`);
+      console.log(`  ├─ Channel: MQTT`);
+      console.log(`  └─ Mengirim command: OFF`);
 
-          // Publish MQTT command to turn pump OFF for this kebun
-          try {
-            const cmdTopic = isKebunA ? TOPIC_CMD_A : TOPIC_CMD_B;
-            const ok = mqttPublish(cmdTopic, { type: "pump", action: "OFF" });
-            if (ok)
-              console.log(`📤 MQTT command sent (${kebun}): OFF [scheduled]`);
-          } catch (e) {
-            console.warn("MQTT publish (scheduled OFF) failed:", e);
-          }
+      // Publish MQTT command to turn pump OFF for this kebun
+      try {
+        const cmdTopic = isKebunA ? TOPIC_CMD_A : TOPIC_CMD_B;
+        const ok = mqttPublish(cmdTopic, { type: "pump", action: "OFF" });
+        if (ok) console.log(`📤 MQTT command sent (${kebun}): OFF [scheduled]`);
+      } catch (e) {
+        console.warn("MQTT publish (scheduled OFF) failed:", e);
+      }
 
-          pompaRef
-            .set("OFF")
-            .then(() => {
-              console.log(
-                `[${stopTime}] ✅ JADWAL END SUCCESS - Kebun ${kebun}:`
-              );
-              console.log(`  ├─ Pompa berhasil dimatikan`);
-              console.log(`  ├─ Firebase response: Success`);
-              console.log(`  ├─ Jadwal operasi selesai`);
-              console.log(`  └─ 🏁 Schedule cycle completed successfully`);
-            })
-            .catch((error) => {
-              console.log(
-                `[${stopTime}] ❌ JADWAL END ERROR - Kebun ${kebun}:`
-              );
-              console.error(`  ├─ Error: ${error.message}`);
-              console.error(`  └─ Gagal mematikan pompa`);
-            });
-        } else if (seconds === 0) {
-          // Log status setiap menit jika tidak ada perubahan
-          const statusTime = new Date().toLocaleTimeString("id-ID");
-          console.log(
-            `[${statusTime}] ➡️ SCHEDULE STATUS OK - Kebun ${kebun}:`
-          );
-          console.log(`  ├─ Status pompa: ${currentStatus}`);
-          console.log(
-            `  ├─ Status sesuai jadwal: ${
-              isWithinSchedule ? "Seharusnya ON" : "Seharusnya OFF"
-            }`
-          );
-          console.log(`  └─ Tidak ada aksi diperlukan`);
-        }
-      })
-      .catch((error) => {
-        if (seconds === 0) {
-          console.error(
-            `[${new Date().toLocaleTimeString(
-              "id-ID"
-            )}] ❌ ERROR reading pump status - Kebun ${kebun}:`,
-            error
-          );
-        }
-      });
+      if (isKebunA) {
+        pumpStatusA = "OFF";
+        updatePumpDisplayA("OFF");
+      } else {
+        pumpStatusB = "OFF";
+        updatePumpDisplayB("OFF");
+      }
+    } else if (seconds === 0) {
+      // Log status setiap menit jika tidak ada perubahan
+      const statusTime = new Date().toLocaleTimeString("id-ID");
+      console.log(`[${statusTime}] ➡️ SCHEDULE STATUS OK - Kebun ${kebun}:`);
+      console.log(`  ├─ Status pompa: ${currentStatus}`);
+      console.log(
+        `  ├─ Status sesuai jadwal: ${
+          isWithinSchedule ? "Seharusnya ON" : "Seharusnya OFF"
+        }`
+      );
+      console.log(`  └─ Tidak ada aksi diperlukan`);
+    }
+    // no DB read errors in local mode
   };
 
   // Start checking schedule immediately

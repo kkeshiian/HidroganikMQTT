@@ -1,3 +1,86 @@
+# HidroganikMQTT
+
+## Store MQTT telemetry into MySQL
+
+This project now uses Firebase only for authentication. To persist telemetry from devices, run a small MQTT → HTTP ingester that posts data into MySQL through a secured API endpoint.
+
+### 1) Create database table
+
+Run the migration to create `telemetry_logs`:
+
+```
+php spark migrate
+```
+
+Ensure your database credentials are set in `.env` or in `app/Config/Database.php`.
+
+### 2) Configure API token
+
+Add an ingest token in your `.env` (server side):
+
+```
+INGEST_TOKEN=change-me
+```
+
+The API endpoint is:
+
+- POST `/api/telemetry/ingest`
+- Header: `X-INGEST-TOKEN: <INGEST_TOKEN>`
+- JSON body example:
+
+```json
+{
+  "kebun": "kebun-a",
+  "ph": 6.5,
+  "tds": 850,
+  "suhu": 25.2,
+  "cal_ph_asam": 4.01,
+  "cal_ph_netral": 6.86,
+  "cal_tds_k": 0.5,
+  "timestamp": 1730325600000
+}
+```
+
+### 3) Run MQTT ingester
+
+There is a simple Node script in `mqtt-bridge/ingest.js`.
+
+Requirements: Node.js >= 16.
+
+Install dependencies and run:
+
+```
+cd mqtt-bridge
+npm init -y
+npm i mqtt axios
+setx INGEST_URL "http://localhost/hidroganik/api/telemetry/ingest"
+setx INGEST_TOKEN "change-me"
+setx MQTT_URL "wss://broker.hivemq.com:8884/mqtt"
+setx MQTT_TOPIC "hidroganik/+/telemetry"
+node ingest.js
+```
+
+Adjust the variables as needed. The ingester subscribes to telemetry topic(s), parses JSON payload, and posts them to the API which stores rows into `telemetry_logs`.
+
+### 4) Using the data
+
+Create a controller/view to query `telemetry_logs` via `App\Models\TelemetryModel` for reports, CSV export, or dashboards.
+
+Example fetch (PHP):
+
+```php
+$model = new \App\Models\TelemetryModel();
+$rows = $model->where('kebun', 'kebun-a')
+							->orderBy('timestamp_ms', 'DESC')
+							->limit(100)
+							->find();
+```
+
+Notes:
+
+- The website front-end reads/writes no Firebase DB anymore.
+- Only login uses Firebase Auth on the server.
+
 # CodeIgniter 4 Application Starter
 
 ## What is CodeIgniter?
@@ -30,11 +113,11 @@ and any database settings.
 
 ## Important Change with index.php
 
-`index.php` is no longer in the root of the project! It has been moved inside the *public* folder,
+`index.php` is no longer in the root of the project! It has been moved inside the _public_ folder,
 for better security and separation of components.
 
-This means that you should configure your web server to "point" to your project's *public* folder, and
-not to the project root. A better practice would be to configure a virtual host to point there. A poor practice would be to point your web server to the project root and expect to enter *public/...*, as the rest of your logic and the
+This means that you should configure your web server to "point" to your project's _public_ folder, and
+not to the project root. A better practice would be to configure a virtual host to point there. A poor practice would be to point your web server to the project root and expect to enter _public/..._, as the rest of your logic and the
 framework are exposed.
 
 **Please** read the user guide for a better explanation of how CI4 works!
@@ -56,6 +139,7 @@ PHP version 8.1 or higher is required, with the following extensions installed:
 - [mbstring](http://php.net/manual/en/mbstring.installation.php)
 
 > [!WARNING]
+>
 > - The end of life date for PHP 7.4 was November 28, 2022.
 > - The end of life date for PHP 8.0 was November 26, 2023.
 > - If you are still using PHP 7.4 or 8.0, you should upgrade immediately.
